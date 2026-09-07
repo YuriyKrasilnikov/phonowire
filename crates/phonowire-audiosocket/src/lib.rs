@@ -15,6 +15,7 @@ mod encoder;
 pub(crate) mod envelope;
 mod error;
 mod message;
+mod session;
 mod wire_type;
 
 pub(crate) const HEADER_BYTES: usize = 3;
@@ -26,4 +27,5 @@ pub use encoder::{EncodeError, encode, encode_raw};
 pub use envelope::{RawEnvelope, RawEnvelopeError};
 pub use error::TypedMessageError;
 pub use message::{Dtmf, OpaquePayload, TypedMessage, Uuid};
+pub use session::{IncomingEvent, IncomingSession, IncomingSessionError, SessionEnd};
 pub use wire_type::{KnownWireType, UnknownWireType, UnknownWireTypeError, WireType};

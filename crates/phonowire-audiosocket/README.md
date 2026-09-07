@@ -1,9 +1,17 @@
 # phonowire-audiosocket
 
-`no_std` AudioSocket framing and wire values with borrowed payload views and
-explicit semantic validation. `RawDecoder` preserves each complete envelope;
-`Decoder` refuses malformed known message shapes before body storage and returns
-typed messages. Both decode at most one frame per call, use caller-owned scratch,
-and require `finish` to declare EOF. `encode` and `encode_raw` write one complete
-frame only when the whole destination is available. Returned values borrow caller
-scratch; the crate owns no caller input, allocates nothing, and performs no I/O.
+Allocation-free, `no_std` AudioSocket framing with borrowed payloads and explicit
+validation. `RawDecoder` preserves complete wire envelopes; `Decoder` validates
+known message shapes before body storage and returns typed messages. Both use
+caller-owned scratch and return at most one frame per feed. `finish` distinguishes
+complete input from truncation. `encode` and `encode_raw` preserve the destination
+if the entire frame does not fit.
+
+`IncomingSession` applies the incoming UUID, 8 kHz PCM, DTMF and end policy to typed
+messages. Decoded views borrow scratch; session events preserve their payload
+borrow and protocol UUID. The crate owns no caller storage and performs no I/O.
+
+Run `cargo run --example incoming_session` for a complete decoder/session consumer
+using fragmented literal input and explicit end-of-input validation.
+
+Rust 1.98.1, Edition 2024. Licensed under Apache-2.0; copyright Yuriy Krasilnikov.

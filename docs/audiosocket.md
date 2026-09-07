@@ -37,3 +37,23 @@ creating a raw envelope or choosing a numeric type tag.
 `encode` and `encode_raw` write a single exact frame into a caller destination.
 They check the complete output capacity before changing it; on success they leave
 the remaining destination suffix untouched.
+
+## Incoming session policy
+
+`IncomingSession` applies the selected AP1 incoming policy to already validated
+`TypedMessage` values. Its first UUID establishes the protocol identity, including
+an all-zero UUID. Audio and DTMF before that UUID fail with `MissingUuid`. Exactly
+8 kHz PCM and the ASCII digits `0`–`9`, `*`, `#`, and `A`–`D` are accepted; other
+rates and digits fail. A second UUID and every unknown type also fail. Each policy
+failure ends the session, and every later message or reported EOF returns
+`AfterEnd`.
+
+Terminate, peer error, and clean end of input end a session without a policy
+failure and remain distinct `SessionEnd` values. They may happen before a UUID,
+so their event identity is optional. A peer-error event borrows its opaque payload
+from the typed message; the session owns only its UUID state.
+
+`IncomingSession` does not decode bytes. The caller reports clean EOF only after
+its byte decoder successfully finishes at a frame boundary. A malformed or
+truncated decoder result stays a decoder error rather than becoming a clean
+session EOF.
