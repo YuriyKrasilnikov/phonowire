@@ -3,6 +3,7 @@ use crate::{
     AudioPayload, Dtmf, KnownWireType, OpaquePayload, SampleRate, TypedMessage, TypedMessageError,
     UnknownWireType, Uuid, WireType,
 };
+use core::fmt;
 
 /// Failure to form a raw envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10,6 +11,14 @@ pub enum RawEnvelopeError {
     /// Payload exceeds the u16 wire-length limit.
     PayloadTooLong,
 }
+
+impl fmt::Display for RawEnvelopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("payload exceeds the u16 wire-length limit")
+    }
+}
+
+impl core::error::Error for RawEnvelopeError {}
 
 /// A borrowed raw frame body paired with any wire type byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,13 +28,17 @@ pub struct RawEnvelope<'a> {
 }
 
 impl<'a> RawEnvelope<'a> {
+    pub(crate) const fn from_wire_bounded(wire_type: WireType, payload: &'a [u8]) -> Self {
+        Self { wire_type, payload }
+    }
+
     /// Preserves any wire type and a payload no longer than 65535 bytes.
     ///
     /// # Errors
     ///
     /// Returns [`RawEnvelopeError::PayloadTooLong`] for a payload above the wire limit.
-    pub fn new(wire_type: WireType, payload: &'a [u8]) -> Result<Self, RawEnvelopeError> {
-        if payload.len() > usize::from(u16::MAX) {
+    pub const fn new(wire_type: WireType, payload: &'a [u8]) -> Result<Self, RawEnvelopeError> {
+        if payload.len() > crate::MAX_BODY_BYTES {
             return Err(RawEnvelopeError::PayloadTooLong);
         }
         Ok(Self { wire_type, payload })
@@ -46,60 +59,58 @@ impl<'a> RawEnvelope<'a> {
     ///
     /// Returns a precise [`TypedMessageError`] for a known type whose body violates policy.
     pub fn typed(self) -> Result<TypedMessage<'a>, TypedMessageError> {
+        validate_typed_length(self.wire_type, self.payload.len())?;
         match self.wire_type.known() {
-            Some(KnownWireType::Terminate) if self.payload.is_empty() => {
-                Ok(TypedMessage::Terminate)
-            }
-            Some(KnownWireType::Terminate) => Err(TypedMessageError::TerminatePayload),
-            Some(KnownWireType::Uuid) => self.uuid(),
+            Some(KnownWireType::Terminate) => Ok(TypedMessage::Terminate),
+            Some(KnownWireType::Uuid) => Ok(self.uuid()),
             Some(KnownWireType::Dtmf) => self.dtmf(),
-            Some(KnownWireType::Pcm8Khz) => self.audio(SampleRate::Khz8),
-            Some(KnownWireType::Pcm12Khz) => self.audio(SampleRate::Khz12),
-            Some(KnownWireType::Pcm16Khz) => self.audio(SampleRate::Khz16),
-            Some(KnownWireType::Pcm24Khz) => self.audio(SampleRate::Khz24),
-            Some(KnownWireType::Pcm32Khz) => self.audio(SampleRate::Khz32),
-            Some(KnownWireType::Pcm44Khz) => self.audio(SampleRate::Khz44_1),
-            Some(KnownWireType::Pcm48Khz) => self.audio(SampleRate::Khz48),
-            Some(KnownWireType::Pcm96Khz) => self.audio(SampleRate::Khz96),
-            Some(KnownWireType::Pcm192Khz) => self.audio(SampleRate::Khz192),
+            Some(KnownWireType::Pcm8Khz) => Ok(self.audio(SampleRate::Khz8)),
+            Some(KnownWireType::Pcm12Khz) => Ok(self.audio(SampleRate::Khz12)),
+            Some(KnownWireType::Pcm16Khz) => Ok(self.audio(SampleRate::Khz16)),
+            Some(KnownWireType::Pcm24Khz) => Ok(self.audio(SampleRate::Khz24)),
+            Some(KnownWireType::Pcm32Khz) => Ok(self.audio(SampleRate::Khz32)),
+            Some(KnownWireType::Pcm44Khz) => Ok(self.audio(SampleRate::Khz44_1)),
+            Some(KnownWireType::Pcm48Khz) => Ok(self.audio(SampleRate::Khz48)),
+            Some(KnownWireType::Pcm96Khz) => Ok(self.audio(SampleRate::Khz96)),
+            Some(KnownWireType::Pcm192Khz) => Ok(self.audio(SampleRate::Khz192)),
             Some(KnownWireType::Error) => Ok(TypedMessage::Error(
-                OpaquePayload::new(self.payload)
-                    .map_err(|_| TypedMessageError::UnknownTypeClassification)?,
+                OpaquePayload::from_wire_bounded(self.payload),
             )),
-            None => self.unknown(),
+            None => Ok(self.unknown()),
         }
     }
-    fn uuid(self) -> Result<TypedMessage<'a>, TypedMessageError> {
-        let bytes =
-            <[u8; 16]>::try_from(self.payload).map_err(|_| TypedMessageError::UuidLength)?;
-        Ok(TypedMessage::Uuid(Uuid::new(bytes)))
+    const fn uuid(self) -> TypedMessage<'a> {
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(self.payload);
+        TypedMessage::Uuid(Uuid::new(bytes))
     }
-    const fn dtmf(self) -> Result<TypedMessage<'a>, TypedMessageError> {
-        if self.payload.len() != 1 {
-            return Err(TypedMessageError::DtmfLength);
-        }
-        let value = self.payload[0];
-        if !value.is_ascii() {
-            return Err(TypedMessageError::DtmfNotAscii);
-        }
-        Ok(TypedMessage::Dtmf(Dtmf::new(value)))
+    fn dtmf(self) -> Result<TypedMessage<'a>, TypedMessageError> {
+        Dtmf::new(self.payload[0]).map(TypedMessage::Dtmf)
     }
-    const fn audio(self, rate: SampleRate) -> Result<TypedMessage<'a>, TypedMessageError> {
-        if !self.payload.len().is_multiple_of(2) {
-            return Err(TypedMessageError::OddPcmLength);
-        }
-        Ok(TypedMessage::Audio {
+    const fn audio(self, rate: SampleRate) -> TypedMessage<'a> {
+        TypedMessage::Audio {
             rate,
-            payload: AudioPayload::new(self.payload),
-        })
+            payload: AudioPayload::from_validated(self.payload),
+        }
     }
-    fn unknown(self) -> Result<TypedMessage<'a>, TypedMessageError> {
-        let wire_type = UnknownWireType::new(self.wire_type.value())
-            .map_err(|_| TypedMessageError::UnknownTypeClassification)?;
-        Ok(TypedMessage::Unknown {
+    const fn unknown(self) -> TypedMessage<'a> {
+        let wire_type = UnknownWireType::from_unassigned(self.wire_type.value());
+        TypedMessage::Unknown {
             wire_type,
-            payload: OpaquePayload::new(self.payload)
-                .map_err(|_| TypedMessageError::UnknownTypeClassification)?,
-        })
+            payload: OpaquePayload::from_wire_bounded(self.payload),
+        }
+    }
+}
+
+pub const fn validate_typed_length(
+    wire_type: WireType,
+    length: usize,
+) -> Result<(), TypedMessageError> {
+    match wire_type.value() {
+        0x00 if length != 0 => Err(TypedMessageError::TerminatePayload),
+        0x01 if length != 16 => Err(TypedMessageError::UuidLength),
+        0x03 if length != 1 => Err(TypedMessageError::DtmfLength),
+        0x10..=0x18 if !length.is_multiple_of(2) => Err(TypedMessageError::OddPcmLength),
+        _ => Ok(()),
     }
 }

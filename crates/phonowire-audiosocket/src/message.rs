@@ -23,8 +23,16 @@ impl Uuid {
 pub struct Dtmf(u8);
 
 impl Dtmf {
-    pub(crate) const fn new(value: u8) -> Self {
-        Self(value)
+    /// Validates an ASCII DTMF byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::TypedMessageError::DtmfNotAscii`] for a non-ASCII byte.
+    pub const fn new(value: u8) -> Result<Self, crate::TypedMessageError> {
+        if !value.is_ascii() {
+            return Err(crate::TypedMessageError::DtmfNotAscii);
+        }
+        Ok(Self(value))
     }
     /// Returns the original ASCII byte.
     #[must_use]
@@ -38,13 +46,16 @@ impl Dtmf {
 pub struct OpaquePayload<'a>(&'a [u8]);
 
 impl<'a> OpaquePayload<'a> {
+    pub(crate) const fn from_wire_bounded(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
     /// Validates an opaque payload for a wire-representable typed message.
     ///
     /// # Errors
     ///
     /// Returns [`RawEnvelopeError::PayloadTooLong`] above the `u16` wire limit.
-    pub fn new(bytes: &'a [u8]) -> Result<Self, RawEnvelopeError> {
-        if bytes.len() > usize::from(u16::MAX) {
+    pub const fn new(bytes: &'a [u8]) -> Result<Self, RawEnvelopeError> {
+        if bytes.len() > crate::MAX_BODY_BYTES {
             return Err(RawEnvelopeError::PayloadTooLong);
         }
         Ok(Self(bytes))

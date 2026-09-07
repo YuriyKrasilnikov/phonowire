@@ -1,4 +1,5 @@
 //! Wire-type classification without losing unknown values.
+use core::fmt;
 
 /// A raw `AudioSocket` type byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -84,6 +85,9 @@ pub enum KnownWireType {
 pub struct UnknownWireType(u8);
 
 impl UnknownWireType {
+    pub(crate) const fn from_unassigned(value: u8) -> Self {
+        Self(value)
+    }
     /// Rejects bytes that identify a documented type.
     ///
     /// # Errors
@@ -109,3 +113,11 @@ pub enum UnknownWireTypeError {
     /// The supplied byte is a known protocol type.
     KnownType,
 }
+
+impl fmt::Display for UnknownWireTypeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("type byte identifies a documented wire type")
+    }
+}
+
+impl core::error::Error for UnknownWireTypeError {}

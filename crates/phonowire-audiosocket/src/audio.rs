@@ -1,4 +1,25 @@
 //! PCM payload views and declared rates.
+use core::fmt;
+
+/// Failure to create a PCM16LE payload view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioPayloadError {
+    /// PCM16LE requires an even number of bytes.
+    OddLength,
+    /// The payload exceeds the wire's `u16` length limit.
+    PayloadTooLong,
+}
+
+impl fmt::Display for AudioPayloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::OddLength => "PCM payload has an odd byte length",
+            Self::PayloadTooLong => "PCM payload exceeds the u16 wire-length limit",
+        })
+    }
+}
+
+impl core::error::Error for AudioPayloadError {}
 
 /// A documented PCM sample rate declared by the wire type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,7 +67,23 @@ impl SampleRate {
 pub struct AudioPayload<'a>(&'a [u8]);
 
 impl<'a> AudioPayload<'a> {
-    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
+    /// Validates an even PCM16LE payload that fits the wire length field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioPayloadError::OddLength`] for an odd byte count and
+    /// [`AudioPayloadError::PayloadTooLong`] above the wire limit.
+    pub const fn new(bytes: &'a [u8]) -> Result<Self, AudioPayloadError> {
+        if bytes.len() > crate::MAX_BODY_BYTES {
+            return Err(AudioPayloadError::PayloadTooLong);
+        }
+        if !bytes.len().is_multiple_of(2) {
+            return Err(AudioPayloadError::OddLength);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub(crate) const fn from_validated(bytes: &'a [u8]) -> Self {
         Self(bytes)
     }
 

@@ -1,7 +1,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn, missing_docs)]
-//! Borrowed, allocation-free `AudioSocket` wire values.
+//! Borrowed, allocation-free `AudioSocket` wire values and streaming framing.
 //!
 //! ```
 //! use phonowire_audiosocket::{RawEnvelope, TypedMessage, WireType};
@@ -10,12 +10,19 @@
 //! ```
 
 mod audio;
-mod envelope;
+mod decoder;
+mod encoder;
+pub(crate) mod envelope;
 mod error;
 mod message;
 mod wire_type;
 
-pub use audio::{AudioPayload, SampleRate};
+pub(crate) const HEADER_BYTES: usize = 3;
+pub(crate) const MAX_BODY_BYTES: usize = 65_535;
+
+pub use audio::{AudioPayload, AudioPayloadError, SampleRate};
+pub use decoder::{DecodeError, DecodeOutcome, Decoder, FinishError, RawDecoder};
+pub use encoder::{EncodeError, encode, encode_raw};
 pub use envelope::{RawEnvelope, RawEnvelopeError};
 pub use error::TypedMessageError;
 pub use message::{Dtmf, OpaquePayload, TypedMessage, Uuid};
