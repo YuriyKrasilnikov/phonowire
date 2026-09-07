@@ -1,32 +1,90 @@
-# Phonowire AudioSocket
+# Phonowire
 
-A portable AudioSocket codec and incoming-session policy for Rust. The crate uses
-caller-owned storage, allocates nothing, and has no external dependencies.
+Portable protocol components for telephony applications, starting with
+AudioSocket. The `phonowire-audiosocket` crate provides allocation-free,
+`no_std` framing and incoming-session policy with no external dependencies.
+Applications own I/O and storage; the codec processes byte slices.
 
-- Raw and typed framing across arbitrary byte chunks.
-- Validated UUID, ASCII DTMF, all nine declared PCM rates and opaque payloads.
-- Exact encoding with unchanged output on insufficient capacity.
-- Explicit truncation, capacity refusal and terminal session outcomes.
+## AudioSocket support
 
-The [protocol contract](docs/audiosocket.md) distinguishes wire rules from the
-incoming 8 kHz session policy. Asterisk 23.2.0 is the selected laboratory target;
-a real peer connection has not been tested. Network transports are outside this
-crate.
+- Raw envelopes preserve every type byte and bounded payload.
+- Typed messages validate UUID, ASCII DTMF, nine PCM rates and opaque values.
+- Incremental decoders preserve framing across fragmented or coalesced input.
+- Encoding preserves the destination when a complete frame cannot fit.
+- Explicit errors distinguish malformed input, capacity refusal and truncation.
+- Incoming sessions preserve UUID identity and separate terminal causes.
 
-Build with Rust 1.98.1 (Edition 2024):
+The [protocol contract](docs/audiosocket.md) separates general wire values from
+the incoming 8 kHz session policy. Asterisk 23.2.0 is the selected laboratory
+target; compatibility with a running peer has not yet been demonstrated.
 
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo doc --workspace --no-deps
+## Storage and lifetime
+
+```mermaid
+flowchart LR
+    Input["Received byte slice"] --> Decoder["Decoder with caller scratch"]
+    Decoder --> Message["Borrowed typed message"]
+    Message --> Session["IncomingSession"]
+    Session --> Consumer["Application consumes event"]
 ```
 
-The [incoming-session example](crates/phonowire-audiosocket/examples/incoming_session.rs)
-feeds fragmented literal frames through the decoder and session, then reports a
-clean end only after successful framing completion:
+The decoder copies payload bytes into caller-provided scratch. Its returned
+view borrows the decoder, so that storage cannot be reused while the view is
+still used. Retaining data beyond that borrow requires an explicit owned copy.
+`finish` reports an incomplete frame; report clean session EOF only after it
+succeeds. Allocation-free decoding therefore does not mean zero-copy decoding.
+
+## Try the consumer
+
+Requires Rust 1.98.1 and Edition 2024. The repository pins its toolchain.
+From the workspace root:
 
 ```sh
 cargo run --example incoming_session
 ```
 
-Licensed under [Apache-2.0](LICENSE). Copyright 2026 Yuriy Krasilnikov.
+The [example](crates/phonowire-audiosocket/examples/incoming_session.rs) feeds
+fragmented literal frames through the decoder and session, then validates clean
+completion. The [crate README](crates/phonowire-audiosocket/README.md) describes
+the public entry points.
+
+## Repository layout
+
+```text
+Cargo.toml                    Workspace metadata and lints
+Cargo.lock                    Reproducible workspace dependency resolution
+rust-toolchain.toml           Pinned compiler version
+docs/audiosocket.md            Wire and session contract
+crates/phonowire-audiosocket/
+    Cargo.toml                Package metadata
+    README.md                 Package overview
+    src/lib.rs                Public API exports
+    src/                      Wire values, framing, encoding, session and errors
+    tests/                    Public API and conformance tests
+    examples/                 Executable decoder/session consumer
+LICENSE                       Apache License 2.0
+NOTICE                        Copyright attribution
+```
+
+The virtual workspace shares package metadata and lints. The codec's modules
+separate wire values, validation, incremental framing, encoding and session
+ordering. Runtime and operating-system choices belong to consumers of this API.
+
+## Validate and read the API
+
+```sh
+cargo fmt --all -- --check
+cargo build --workspace --all-targets
+cargo test --workspace --all-targets
+cargo test --workspace --doc
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+cargo package --offline --locked
+```
+
+The tests compare observable bytes, cursor movement, errors and session events
+against independent expectations. The finite conformance suite is not a proof
+of every possible stream or a measurement of network capacity.
+
+The package is currently unpublished. Licensed under [Apache-2.0](LICENSE).
+Copyright 2026 Yuriy Krasilnikov; see [NOTICE](NOTICE).
