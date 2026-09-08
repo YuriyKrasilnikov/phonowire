@@ -17,8 +17,10 @@ observations, explicit resource credits and caller-controlled shutdown.
 - Incoming sessions preserve UUID identity and separate terminal causes.
 
 The [protocol contract](docs/audiosocket.md) separates general wire values from
-the incoming 8 kHz session policy. Asterisk 23.2.0 is the selected laboratory
-target; compatibility with a running peer has not yet been demonstrated.
+the incoming 8 kHz session policy. Laboratory calls from Asterisk 23.2.0
+confirmed exact incoming PCM and separate connection identities for two
+simultaneous streams, including controlled fragmentation and natural TCP EOF.
+The contract describes the tested profile and its compatibility limits.
 
 ## Storage and lifetime
 
@@ -50,6 +52,25 @@ fragmented literal frames through the decoder and session, then validates clean
 completion. The [crate README](crates/phonowire-audiosocket/README.md) describes
 the public entry points.
 
+## Use the libraries
+
+Both crates are currently unpublished. To use a local source checkout from a
+sibling application, add the required dependencies to that application's
+`Cargo.toml`:
+
+```toml
+[dependencies]
+phonowire-receiver = { path = "../phonowire/crates/phonowire-receiver" }
+phonowire-audiosocket = { path = "../phonowire/crates/phonowire-audiosocket" }
+```
+
+Paths are relative to the application's manifest. The receiver requires Linux.
+A codec-only application needs just `phonowire-audiosocket`. Add the codec beside
+the receiver when naming its public types, such as `Uuid` or `SampleRate`; use
+both crates from the same checkout. The receiver itself already depends on the
+codec. The workspace lockfile fixes this repository's dependency resolution;
+an independent application manages its own lockfile.
+
 ## TCP reception
 
 The [receiver API](crates/phonowire-receiver/README.md) separates network work
@@ -57,8 +78,8 @@ from record consumption. A caller-owned thread runs `Receiver::run`; another
 consumer removes records, processes or retains their payloads, and returns
 queue or byte capacity. Raw transport observations precede protocol events.
 The receiver reports abandoned work at cancellation and keeps retained data
-charged across worker restarts. These resource bounds are not a measured call
-capacity or a peer interoperability certification.
+charged across worker restarts. These resource bounds do not establish a
+measured call capacity or a latency guarantee.
 
 `Recording` consumes one connection's records into exact wire bytes, accepted
 PCM WAVE audio and diagnostic text. Finalization preserves terminal meaning;
@@ -110,5 +131,9 @@ The tests compare observable bytes, cursor movement, errors and session events
 against independent expectations. The finite conformance suite is not a proof
 of every possible stream or a measurement of network capacity.
 
-The package is currently unpublished. Licensed under [Apache-2.0](LICENSE).
+The package command above verifies the codec archive. Receiver use from the
+source workspace is separate from registry packaging: its sibling codec must
+also be available when resolving a normalized receiver package.
+
+Licensed under [Apache-2.0](LICENSE).
 Copyright 2026 Yuriy Krasilnikov; see [NOTICE](NOTICE).

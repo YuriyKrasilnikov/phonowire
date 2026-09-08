@@ -8,6 +8,10 @@ policy; Mio supplies readiness notifications.
 The incoming profile accepts one UUID before mono PCM16LE at 8 kHz or supported
 DTMF. This describes the receiver's policy. Compatibility with a particular peer
 also depends on its version, operating mode and codec configuration.
+Laboratory calls from Asterisk 23.2.0's AudioSocket application on answered
+Local/n channels preserved two independent incoming 8 kHz streams, including
+controlled fragmentation and natural TCP EOF. This result does not cover a
+customer SIP/RTP path, DTMF interoperability, reverse playback or load capacity.
 
 ## Ownership and progress
 
@@ -60,6 +64,26 @@ into a `std::thread` when reception and consumption need separate threads.
 `StopHandle` supplies an independent stop path. A stop cancels pending connection
 work; it does not promise that every received byte reached the consumer. Queued
 records remain available after the worker stops.
+
+## Application lifecycle
+
+1. Create validated `Limits` and a shared `ByteBudget`, then call `Receiver::bind`.
+2. Move the receiver to a caller-owned worker thread and run `Receiver::run`.
+   Consume `Records` concurrently so a full queue can make progress.
+3. Route records by `ConnectionId`. Give each connection its own `Recording`
+   and output writers, starting with its `Connected` record. Handle each record
+   in order and drop it when its payload is no longer needed.
+4. After a terminal record, call `Recording::finish` and check both writer
+   errors and the returned terminal meaning. Finishing the files does not
+   turn a failed or truncated call into a successful call.
+5. On normal application completion or a consumer failure, request stop and
+   join the worker. Check its result and cancellation accounting. Queued records
+   remain available; consume or discard them explicitly and release any retained
+   payloads. Finish any remaining recorder with its incomplete outcome if no
+   terminal record reached it.
+
+Stopping before terminal records arrive cancels pending work. Applications that
+need complete calls must consume their terminal records before requesting stop.
 
 ## Limits and observations
 

@@ -6,11 +6,26 @@ ASCII DTMF byte, `10`–`18` PCM16LE mono at 8k, 12k, 16k, 24k, 32k, 44.1k, 48k,
 96k, and 192k Hz, and `ff` opaque peer error. Unassigned bytes remain explicit
 unknown frames with opaque payloads.
 
-The selected target is upstream Asterisk 23.2.0, AudioSocket dialplan application,
-signed linear PCM16LE mono at 8kHz, direction Asterisk to service only. The wire
-reference is [Asterisk AudioSocket documentation](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/).
-This is a pinned lab profile, not evidence of a successful peer connection, a
-customer configuration, reverse playback, or deployment compatibility.
+The wire reference is [Asterisk AudioSocket documentation](https://docs.asterisk.org/Configuration/Channel-Drivers/AudioSocket/).
+
+## Tested interoperability
+
+Laboratory calls used upstream Asterisk 23.2.0 with the AudioSocket dialplan
+application on answered Local/n channels. The direction was Asterisk to receiver,
+with signed linear PCM16LE mono at 8 kHz. Two independent simultaneous connections
+preserved their UUIDs and complete PCM without mixing. Tests included direct TCP
+and a relay that withheld subsequent bytes until the receiver acknowledged
+selected header and body prefixes. One connection closed naturally while the
+other continued sending; both ended at complete frame boundaries with clean TCP
+EOF. Useful audio lasted 1.0 and 1.4 seconds.
+
+This result covers that application profile. It does not establish compatibility
+with every AudioSocket channel-driver configuration, a customer SIP/RTP path,
+DTMF interoperability or reverse playback. It also does not measure sustained
+call capacity, latency, long-duration behavior or lossless shutdown during an
+active call. Other configurations require their own checks.
+
+## Framing and values
 
 Raw envelopes preserve every type byte and payload up to 65535 bytes for diagnostics.
 Typed conversion applies explicit policies: terminate requires an empty payload;
