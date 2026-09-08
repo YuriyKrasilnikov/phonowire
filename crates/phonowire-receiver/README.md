@@ -89,6 +89,16 @@ flushes all three outputs; any failure returns an error. Dropping a recorder doe
 not finalize it. Successful writes and flushes do not promise filesystem `fsync`
 or persistence across power loss.
 
+Run a self-contained localhost call through the receiver and recorder:
+
+```sh
+cargo run -p phonowire-receiver --example record_incoming
+```
+
+The example verifies literal wire and PCM output in memory. Replace its caller
+writers with newly created `File` values to persist those same outputs; keep
+record consumption independent of the worker and handle `finish` explicitly.
+
 ## License
 
 Apache License 2.0. Copyright Yuriy Krasilnikov. See `LICENSE` and `NOTICE`.

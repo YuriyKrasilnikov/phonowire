@@ -63,6 +63,8 @@ capacity or a peer interoperability certification.
 `Recording` consumes one connection's records into exact wire bytes, accepted
 PCM WAVE audio and diagnostic text. Finalization preserves terminal meaning;
 writer failures report their stage and confirmed output prefixes.
+The [recording example](crates/phonowire-receiver/examples/record_incoming.rs)
+executes a literal localhost call through both components.
 
 ## Repository layout
 
