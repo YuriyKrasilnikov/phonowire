@@ -12,6 +12,7 @@ keywords = ["audiosocket", "tcp", "audio"]
 categories = ["network-programming", "multimedia::audio"]
 
 [dependencies]
+libc = "=0.2.189"
 phonowire-audiosocket = { path = "../phonowire-audiosocket", version = "0.1.0" }
 mio = { version = "=1.2.2", default-features = false, features = ["net", "os-poll"] }
 

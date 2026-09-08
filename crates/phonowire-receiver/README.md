@@ -34,6 +34,13 @@ even when the sender sends no further bytes. A task that exhausts its turn budge
 remains ready without waiting for a new network event. Application callbacks and
 disk writes belong to the consuming thread.
 
+Known recoverable errors from an individual `accept` attempt preserve admitted
+connections. Each turn limits attempts; descriptor/memory pressure or a turn
+containing only retryable errors delays further accepts for 100 ms. Pending
+listener readiness is retained, so retry does not require a new network edge.
+Existing connections and stop control continue during that delay. Other socket,
+registration, readiness and wake failures can still end the worker explicitly.
+
 `Receiver::run` executes synchronously on the calling thread. Move the receiver
 into a `std::thread` when reception and consumption need separate threads.
 `StopHandle` supplies an independent stop path. A stop cancels pending connection

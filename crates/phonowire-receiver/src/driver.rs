@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll as TaskPoll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mio::{Events, Interest, Poll, Token};
 
@@ -277,9 +277,20 @@ impl Receiver {
     ///
     /// # Errors
     ///
-    /// Returns runtime setup, socket, notification, identity or counter failure,
-    /// together with the available summary. No runtime fallback is attempted.
+    /// Known per-attempt accept errors preserve existing connections. Descriptor
+    /// or memory pressure during accept pauses retries for 100 ms; an entire
+    /// accept turn containing only retryable errors uses the same pause. Pending
+    /// listener readiness is retained, and connections and stop remain serviced.
+    /// This interval bounds worker retries, not OS scheduling or recovery time.
+    ///
+    /// Returns runtime setup, unclassified accept, socket registration, other
+    /// socket, notification, identity or counter failure, together with the
+    /// available summary. No runtime fallback is attempted.
     pub fn run(self) -> Result<RunSummary, ReceiverError> {
+        self.run_with(SystemAccept)
+    }
+
+    fn run_with(self, mut accept: impl AcceptIo) -> Result<RunSummary, ReceiverError> {
         let poll = Poll::new().map_err(bind_io)?;
         let wake = Arc::new(mio::Waker::new(poll.registry(), CONTROL).map_err(bind_io)?);
         let _attachment = self.signals.attach(&wake);
@@ -304,12 +315,13 @@ impl Receiver {
             live: BTreeMap::new(),
             next: FIRST_CONNECTION,
             listener_ready: true,
+            accept_paused_at: None,
             summary: RunSummary {
                 fixed_buffer_capacity: self.limits.fixed_buffer_capacity(),
                 ..RunSummary::default()
             },
         };
-        let result = worker.drive();
+        let result = worker.drive(&mut accept);
         if matches!(result, Err(ReceiverFailure::CounterExhausted)) {
             worker.summary.counters_complete = false;
         }
@@ -333,6 +345,93 @@ fn bind_io(error: io::Error) -> ReceiverError {
     ReceiverError::before_run(ReceiverFailure::Io(error))
 }
 
+// The operation boundary keeps accept and registration failures distinct.
+trait AcceptIo {
+    fn accept(
+        &mut self,
+        listener: &mio::net::TcpListener,
+    ) -> io::Result<(mio::net::TcpStream, SocketAddr)>;
+
+    fn register(
+        &mut self,
+        registry: &mio::Registry,
+        socket: &mut mio::net::TcpStream,
+        token: Token,
+    ) -> io::Result<()> {
+        registry.register(socket, token, Interest::READABLE)
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+struct SystemAccept;
+
+impl AcceptIo for SystemAccept {
+    fn accept(
+        &mut self,
+        listener: &mio::net::TcpListener,
+    ) -> io::Result<(mio::net::TcpStream, SocketAddr)> {
+        listener.accept()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptFailure {
+    Drained,
+    Retry,
+    Pause,
+    Fatal,
+}
+
+fn classify_accept(error: &io::Error) -> AcceptFailure {
+    // Linux reports pending TCP errors through accept4. Symbolic errno values
+    // preserve distinctions that ErrorKind merges, including EPROTO and EBADF.
+    // https://man7.org/linux/man-pages/man2/accept.2.html
+    match error.raw_os_error() {
+        Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => AcceptFailure::Drained,
+        Some(
+            libc::EINTR
+            | libc::ECONNABORTED
+            | libc::ECONNRESET
+            | libc::ETIMEDOUT
+            | libc::ENETDOWN
+            | libc::EPROTO
+            | libc::ENOPROTOOPT
+            | libc::EHOSTDOWN
+            | libc::ENONET
+            | libc::EHOSTUNREACH
+            | libc::EOPNOTSUPP
+            | libc::ENETUNREACH
+            | libc::EPERM
+            | libc::ESOCKTNOSUPPORT
+            | libc::EPROTONOSUPPORT,
+        ) => AcceptFailure::Retry,
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR) => {
+            AcceptFailure::Pause
+        }
+        Some(_) => AcceptFailure::Fatal,
+        None => match error.kind() {
+            io::ErrorKind::WouldBlock => AcceptFailure::Drained,
+            io::ErrorKind::Interrupted
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable => AcceptFailure::Retry,
+            io::ErrorKind::OutOfMemory => AcceptFailure::Pause,
+            // This kind can be returned by stable std before its variant name
+            // is stabilized. Compare the OS-derived kind through stable APIs.
+            kind if kind == io::Error::from_raw_os_error(libc::EMFILE).kind() => {
+                AcceptFailure::Pause
+            }
+            _ => AcceptFailure::Fatal,
+        },
+    }
+}
+
 struct Entry {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     context: TaskContext,
@@ -351,6 +450,7 @@ struct Worker {
     live: BTreeMap<Token, Entry>,
     next: usize,
     listener_ready: bool,
+    accept_paused_at: Option<Instant>,
     summary: RunSummary,
 }
 
@@ -364,7 +464,7 @@ impl Worker {
             .then_some(StopCause::Requested)
     }
 
-    fn drive(&mut self) -> Result<StopCause, ReceiverFailure> {
+    fn drive(&mut self, accept: &mut impl AcceptIo) -> Result<StopCause, ReceiverFailure> {
         let mut events = Events::with_capacity(EVENT_BATCH);
         loop {
             if let Some(error) = self.signals.take_failure() {
@@ -383,14 +483,8 @@ impl Worker {
             if let Some(cause) = self.stop_cause() {
                 return Ok(cause);
             }
-            if self.listener_ready {
-                self.accept_ready()?;
-            }
-            let timeout = if self.scheduler.has_ready() || self.listener_ready {
-                Duration::ZERO
-            } else {
-                STOP_RECHECK
-            };
+            self.accept_ready(accept)?;
+            let timeout = self.poll_timeout(accept.now());
             match self.poll.poll(&mut events, Some(timeout)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -435,13 +529,35 @@ impl Worker {
         Ok(())
     }
 
-    fn accept_ready(&mut self) -> Result<(), ReceiverFailure> {
+    fn accept_delay(&self, now: Instant) -> Duration {
+        self.accept_paused_at.map_or(Duration::ZERO, |paused_at| {
+            STOP_RECHECK.saturating_sub(now.saturating_duration_since(paused_at))
+        })
+    }
+
+    fn poll_timeout(&self, now: Instant) -> Duration {
+        if self.scheduler.has_ready() {
+            Duration::ZERO
+        } else if self.listener_ready {
+            self.accept_delay(now)
+        } else {
+            STOP_RECHECK
+        }
+    }
+
+    fn accept_ready(&mut self, accept: &mut impl AcceptIo) -> Result<(), ReceiverFailure> {
+        if !self.listener_ready || !self.accept_delay(accept.now()).is_zero() {
+            return Ok(());
+        }
+        self.accept_paused_at = None;
+        let mut progressed = false;
         for _ in 0..self.limits.turn_steps().min(EVENT_BATCH) {
             if self.stop_cause().is_some() {
                 return Ok(());
             }
-            match self.listener.accept() {
-                Ok((mut socket, peer)) => {
+            match accept.accept(&self.listener) {
+                Ok((socket, peer)) => {
+                    progressed = true;
                     if self.live.len() == self.limits.max_connections() {
                         self.summary.refused = self
                             .summary
@@ -450,54 +566,72 @@ impl Worker {
                             .ok_or(ReceiverFailure::CounterExhausted)?;
                         continue;
                     }
-                    let token = allocate_token(&mut self.next)?;
-                    self.poll
-                        .registry()
-                        .register(&mut socket, token, Interest::READABLE)
-                        .map_err(ReceiverFailure::Io)?;
-                    let context = TaskContext::new(
-                        ConnectionId::new(self.instance, token.0),
-                        peer,
-                        token,
-                        TaskResources {
-                            budget: self.budget.clone(),
-                            sender: self.sender.clone(),
-                            scheduler: self.scheduler.clone(),
-                        },
-                    );
-                    let waker = self.scheduler.insert(token);
-                    let future = Box::pin(connection::receive(
-                        socket,
-                        self.limits.payload_capacity(),
-                        context.clone(),
-                    ));
-                    assert!(
-                        self.live
-                            .insert(
-                                token,
-                                Entry {
-                                    future,
-                                    context,
-                                    waker
-                                }
-                            )
-                            .is_none(),
-                        "connection token is fresh"
-                    );
-                    self.summary.accepted = self
-                        .summary
-                        .accepted
-                        .checked_add(1)
-                        .ok_or(ReceiverFailure::CounterExhausted)?;
+                    self.admit(socket, peer, accept)?;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.listener_ready = false;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(ReceiverFailure::Io(error)),
+                Err(error) => match classify_accept(&error) {
+                    AcceptFailure::Drained => {
+                        self.listener_ready = false;
+                        return Ok(());
+                    }
+                    AcceptFailure::Retry => {}
+                    AcceptFailure::Pause => {
+                        self.accept_paused_at = Some(accept.now());
+                        return Ok(());
+                    }
+                    AcceptFailure::Fatal => return Err(ReceiverFailure::Io(error)),
+                },
             }
         }
+        if !progressed {
+            self.accept_paused_at = Some(accept.now());
+        }
+        Ok(())
+    }
+
+    fn admit(
+        &mut self,
+        mut socket: mio::net::TcpStream,
+        peer: SocketAddr,
+        accept: &mut impl AcceptIo,
+    ) -> Result<(), ReceiverFailure> {
+        let token = allocate_token(&mut self.next)?;
+        accept
+            .register(self.poll.registry(), &mut socket, token)
+            .map_err(ReceiverFailure::Io)?;
+        let context = TaskContext::new(
+            ConnectionId::new(self.instance, token.0),
+            peer,
+            token,
+            TaskResources {
+                budget: self.budget.clone(),
+                sender: self.sender.clone(),
+                scheduler: self.scheduler.clone(),
+            },
+        );
+        let waker = self.scheduler.insert(token);
+        let future = Box::pin(connection::receive(
+            socket,
+            self.limits.payload_capacity(),
+            context.clone(),
+        ));
+        assert!(
+            self.live
+                .insert(
+                    token,
+                    Entry {
+                        future,
+                        context,
+                        waker
+                    }
+                )
+                .is_none(),
+            "connection token is fresh"
+        );
+        self.summary.accepted = self
+            .summary
+            .accepted
+            .checked_add(1)
+            .ok_or(ReceiverFailure::CounterExhausted)?;
         Ok(())
     }
 
@@ -627,3 +761,7 @@ mod tests {
         assert_eq!(summary.ended, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "driver_accept_tests.rs"]
+mod accept_tests;
