@@ -4,6 +4,8 @@ Portable protocol components for telephony applications, starting with
 AudioSocket. The `phonowire-audiosocket` crate provides allocation-free,
 `no_std` framing and incoming-session policy with no external dependencies.
 Applications own I/O and storage; the codec processes byte slices.
+The `phonowire-receiver` crate adds bounded Linux TCP reception with owned
+observations, explicit resource credits and caller-controlled shutdown.
 
 ## AudioSocket support
 
@@ -48,6 +50,16 @@ fragmented literal frames through the decoder and session, then validates clean
 completion. The [crate README](crates/phonowire-audiosocket/README.md) describes
 the public entry points.
 
+## TCP reception
+
+The [receiver API](crates/phonowire-receiver/README.md) separates network work
+from record consumption. A caller-owned thread runs `Receiver::run`; another
+consumer removes records, processes or retains their payloads, and returns
+queue or byte capacity. Raw transport observations precede protocol events.
+The receiver reports abandoned work at cancellation and keeps retained data
+charged across worker restarts. These resource bounds are not a measured call
+capacity or a peer interoperability certification.
+
 ## Repository layout
 
 ```text
@@ -62,6 +74,12 @@ crates/phonowire-audiosocket/
     src/                      Wire values, framing, encoding, session and errors
     tests/                    Public API and conformance tests
     examples/                 Executable decoder/session consumer
+crates/phonowire-receiver/
+    Cargo.toml                Linux receiver dependencies
+    README.md                 Resource, observation and shutdown contracts
+    src/lib.rs                Receiver and owned record API
+    src/                      Private connection, scheduling and handoff modules
+    tests/                    Localhost behavior and lifecycle witnesses
 LICENSE                       Apache License 2.0
 NOTICE                        Copyright attribution
 ```
@@ -79,7 +97,7 @@ cargo test --workspace --all-targets
 cargo test --workspace --doc
 cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
-cargo package --offline --locked
+cargo package -p phonowire-audiosocket --offline --locked
 ```
 
 The tests compare observable bytes, cursor movement, errors and session events

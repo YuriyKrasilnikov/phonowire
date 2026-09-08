@@ -1,0 +1,19 @@
+[package]
+name = "phonowire-receiver"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Bounded Linux AudioSocket reception with owned observations"
+publish = false
+readme = "README.md"
+keywords = ["audiosocket", "tcp", "audio"]
+categories = ["network-programming", "multimedia::audio"]
+
+[dependencies]
+phonowire-audiosocket = { path = "../phonowire-audiosocket", version = "0.1.0" }
+mio = { version = "=1.2.2", default-features = false, features = ["net", "os-poll"] }
+
+[lints]
+workspace = true
