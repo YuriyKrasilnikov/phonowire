@@ -1,5 +1,5 @@
 //! Explicit task readiness and resource notifications for one worker.
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::io;
 use std::net::SocketAddr;
@@ -159,15 +159,96 @@ impl Wake for ResourceWake {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Running,
+    // The current poll was woken and already owns a later runnable turn.
+    Notified,
     Queued,
     Waiting(WaitReason),
 }
 
+#[derive(Clone, Copy)]
+struct Links {
+    previous: Option<Token>,
+    next: Option<Token>,
+}
+
+/// FIFO membership that can unlink a live token without scanning other tasks.
+#[derive(Default)]
+struct Order {
+    first: Option<Token>,
+    last: Option<Token>,
+    links: BTreeMap<Token, Links>,
+    #[cfg(test)]
+    accesses: usize,
+}
+
+impl Order {
+    fn link_mut(&mut self, token: Token) -> &mut Links {
+        #[cfg(test)]
+        {
+            self.accesses += 1;
+        }
+        self.links.get_mut(&token).expect("linked token is present")
+    }
+
+    fn push_back(&mut self, token: Token) {
+        #[cfg(test)]
+        {
+            self.accesses += 1;
+        }
+        if self.links.contains_key(&token) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.accesses += 1;
+        }
+        self.links.insert(
+            token,
+            Links {
+                previous: self.last,
+                next: None,
+            },
+        );
+        if let Some(last) = self.last {
+            self.link_mut(last).next = Some(token);
+        } else {
+            self.first = Some(token);
+        }
+        self.last = Some(token);
+    }
+
+    fn remove(&mut self, token: Token) {
+        #[cfg(test)]
+        {
+            self.accesses += 1;
+        }
+        let Some(links) = self.links.remove(&token) else {
+            return;
+        };
+        if let Some(previous) = links.previous {
+            self.link_mut(previous).next = links.next;
+        } else {
+            self.first = links.next;
+        }
+        if let Some(next) = links.next {
+            self.link_mut(next).previous = links.previous;
+        } else {
+            self.last = links.previous;
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Token> {
+        let token = self.first?;
+        self.remove(token);
+        Some(token)
+    }
+}
+
 struct Ready {
     states: BTreeMap<Token, State>,
-    queue: VecDeque<Token>,
-    queue_waiters: BTreeSet<Token>,
-    byte_waiters: BTreeSet<Token>,
+    queue: Order,
+    queue_waiters: Order,
+    byte_waiters: Order,
     capacity: usize,
 }
 
@@ -176,18 +257,38 @@ impl Ready {
         let Some(state) = self.states.get_mut(&token) else {
             return false;
         };
-        if *state == State::Queued {
-            return false;
-        }
-        *state = State::Queued;
-        self.queue_waiters.remove(&token);
-        self.byte_waiters.remove(&token);
+        *state = match *state {
+            State::Queued | State::Notified => return false,
+            State::Running => State::Notified,
+            State::Waiting(_) => State::Queued,
+        };
         assert!(
-            self.queue.len() < self.capacity,
+            self.queue.links.len() < self.capacity,
             "one runnable entry per live connection"
         );
         self.queue.push_back(token);
         true
+    }
+
+    fn requests(&mut self, reason: WaitReason) -> &mut Order {
+        match reason {
+            WaitReason::Queue => &mut self.queue_waiters,
+            WaitReason::Bytes => &mut self.byte_waiters,
+            WaitReason::Kernel => panic!("kernel readiness is addressed by token"),
+        }
+    }
+
+    fn resume_head(&mut self, reason: WaitReason) -> bool {
+        self.requests(reason)
+            .first
+            .is_some_and(|token| self.enqueue(token))
+    }
+
+    fn remove_request(&mut self, token: Token, reason: WaitReason) -> bool {
+        let requests = self.requests(reason);
+        let was_head = requests.first == Some(token);
+        requests.remove(token);
+        was_head && self.resume_head(reason)
     }
 }
 
@@ -204,9 +305,9 @@ impl Scheduler {
         Self(Arc::new(SchedulerInner {
             ready: Mutex::new(Ready {
                 states: BTreeMap::new(),
-                queue: VecDeque::with_capacity(capacity),
-                queue_waiters: BTreeSet::new(),
-                byte_waiters: BTreeSet::new(),
+                queue: Order::default(),
+                queue_waiters: Order::default(),
+                byte_waiters: Order::default(),
                 capacity,
             }),
             signals,
@@ -220,10 +321,10 @@ impl Scheduler {
             "connection admission precedes scheduling"
         );
         assert!(
-            ready.states.insert(token, State::Running).is_none(),
+            ready.states.insert(token, State::Queued).is_none(),
             "tokens are never reused"
         );
-        ready.enqueue(token);
+        ready.queue.push_back(token);
         drop(ready);
         Waker::from(Arc::new(TaskWake {
             token,
@@ -240,7 +341,7 @@ impl Scheduler {
     }
 
     pub fn has_ready(&self) -> bool {
-        !lock(&self.0.ready).queue.is_empty()
+        lock(&self.0.ready).queue.first.is_some()
     }
 
     pub fn io_ready(&self, token: Token) {
@@ -252,30 +353,38 @@ impl Scheduler {
 
     fn park(&self, token: Token, reason: WaitReason) {
         let mut ready = lock(&self.0.ready);
-        *ready.states.get_mut(&token).expect("parking task is live") = State::Waiting(reason);
-        ready.queue.retain(|queued| *queued != token);
-        ready.queue_waiters.remove(&token);
-        ready.byte_waiters.remove(&token);
-        match reason {
-            WaitReason::Kernel => {}
-            WaitReason::Queue => {
-                ready.queue_waiters.insert(token);
-            }
-            WaitReason::Bytes => {
-                ready.byte_waiters.insert(token);
-            }
+        let state = *ready.states.get(&token).expect("parking task is live");
+        let next = if state == State::Notified {
+            // A wake during the poll remains actionable after its wait is known.
+            State::Queued
+        } else {
+            ready.queue.remove(token);
+            State::Waiting(reason)
+        };
+        *ready.states.get_mut(&token).expect("parking task is live") = next;
+        if reason != WaitReason::Kernel {
+            ready.requests(reason).push_back(token);
         }
     }
 
     pub fn resume_credit(&self, reason: WaitReason) {
+        lock(&self.0.ready).resume_head(reason);
+    }
+
+    fn request_turn(&self, token: Token, reason: WaitReason) -> bool {
         let mut ready = lock(&self.0.ready);
-        let waiters = match reason {
-            WaitReason::Kernel => panic!("kernel readiness is addressed by token"),
-            WaitReason::Queue => std::mem::take(&mut ready.queue_waiters),
-            WaitReason::Bytes => std::mem::take(&mut ready.byte_waiters),
-        };
-        for token in waiters {
-            ready.enqueue(token);
+        assert!(ready.states.contains_key(&token), "requesting task is live");
+        let requests = ready.requests(reason);
+        requests.push_back(token);
+        let head = requests.first == Some(token);
+        drop(ready);
+        head
+    }
+
+    fn finish_request(&self, token: Token, reason: WaitReason) {
+        let inserted = lock(&self.0.ready).remove_request(token, reason);
+        if inserted {
+            self.0.signals.wake();
         }
     }
 
@@ -290,9 +399,45 @@ impl Scheduler {
     pub fn retire(&self, token: Token) {
         let mut ready = lock(&self.0.ready);
         ready.states.remove(&token);
-        ready.queue.retain(|queued| *queued != token);
-        ready.queue_waiters.remove(&token);
-        ready.byte_waiters.remove(&token);
+        ready.queue.remove(token);
+        let queue = ready.remove_request(token, WaitReason::Queue);
+        let bytes = ready.remove_request(token, WaitReason::Bytes);
+        drop(ready);
+        if queue || bytes {
+            self.0.signals.wake();
+        }
+    }
+}
+
+/// An operation keeps its admission position across retries and CPU yields.
+struct Request<'scheduler> {
+    scheduler: &'scheduler Scheduler,
+    token: Token,
+    reason: WaitReason,
+    registered: bool,
+}
+
+impl<'scheduler> Request<'scheduler> {
+    const fn new(scheduler: &'scheduler Scheduler, token: Token, reason: WaitReason) -> Self {
+        Self {
+            scheduler,
+            token,
+            reason,
+            registered: false,
+        }
+    }
+
+    fn is_head(&mut self) -> bool {
+        self.registered = true;
+        self.scheduler.request_turn(self.token, self.reason)
+    }
+}
+
+impl Drop for Request<'_> {
+    fn drop(&mut self) {
+        if self.registered {
+            self.scheduler.finish_request(self.token, self.reason);
+        }
     }
 }
 
@@ -447,8 +592,19 @@ impl TaskContext {
     }
 
     pub async fn copy(&self, bytes: &[u8]) -> Result<OwnedBytes, BudgetError> {
+        let mut request = Request::new(&self.scheduler, self.token, WaitReason::Bytes);
         poll_fn(|context| {
             if !self.permit(context) {
+                return Poll::Pending;
+            }
+            if bytes.len() > self.budget.capacity() {
+                return Poll::Ready(Err(BudgetError::TooLarge {
+                    required: bytes.len(),
+                    capacity: self.budget.capacity(),
+                }));
+            }
+            if !request.is_head() {
+                self.park(WaitReason::Bytes);
                 return Poll::Pending;
             }
             match self.budget.try_copy(bytes) {
@@ -464,6 +620,7 @@ impl TaskContext {
     }
 
     pub async fn send(&self, record: Record) -> Result<(), SendFailure> {
+        let mut request = Request::new(&self.scheduler, self.token, WaitReason::Queue);
         let mut pending = Some(record);
         lock(&self.progress).pending_record = true;
         poll_fn(|context| {
@@ -480,6 +637,10 @@ impl TaskContext {
                 drop(progress);
                 next
             };
+            if !request.is_head() {
+                self.park(WaitReason::Queue);
+                return Poll::Pending;
+            }
             let record = pending
                 .take()
                 .expect("send retains its record until completion");
@@ -702,3 +863,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler_tests.rs"]
+mod resource_tests;

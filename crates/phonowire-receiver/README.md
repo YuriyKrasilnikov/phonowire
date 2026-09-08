@@ -34,6 +34,20 @@ even when the sender sends no further bytes. A task that exhausts its turn budge
 remains ready without waiting for a new network event. Application callbacks and
 disk writes belong to the consuming thread.
 
+Queue and byte allocation requests use separate FIFO admission orders. A new
+receiver request joins behind existing requests, including when its connection
+is already runnable. Only the oldest request may try the resource; success or
+cancellation gives the next request a turn. Byte requests wait for their full
+size, so a large request can delay smaller requests behind it. This prevents
+younger receiver requests from repeatedly consuming its released capacity.
+
+Progress requires continued worker execution, queue consumption, and eventual
+release of retained bytes. Public `ByteBudget::try_copy` calls remain independent:
+they can use available capacity while a receiver request waits. Fairness among
+receiver requests does not guarantee progress against an external caller that
+continually takes that capacity. No bytes are reserved merely by waiting, and
+`ByteBudget::used` continues to report retained output capacity.
+
 Known recoverable errors from an individual `accept` attempt preserve admitted
 connections. Each turn limits attempts; descriptor/memory pressure or a turn
 containing only retryable errors delays further accepts for 100 ms. Pending

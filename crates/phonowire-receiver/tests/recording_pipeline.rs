@@ -174,3 +174,164 @@ fn fragmented_tcp_records_playable_terminated_pcm() {
 fn fragmented_tcp_records_truncated_prefix_without_success() {
     run(Ending::Truncated);
 }
+
+struct CallOutput {
+    recording: Recording<File, File, File>,
+    path: PathBuf,
+    sender: Option<u8>,
+}
+impl CallOutput {
+    fn new(record: &phonowire_receiver::Record, directory: &Directory) -> Self {
+        let path = directory.0.join(record.connection.sequence().to_string());
+        fs::create_dir(&path).expect("connection output directory");
+        let recording = Recording::new(
+            record.connection,
+            file(&path.join("wire.bin")),
+            file(&path.join("audio.wav")),
+            file(&path.join("events.txt")),
+        )
+        .expect("recording");
+        Self {
+            recording,
+            path,
+            sender: None,
+        }
+    }
+    fn finish(self) -> u64 {
+        let sender = self.sender.expect("UUID precedes terminal");
+        let (wire, pcm) = concurrent_fixture(sender);
+        let summary = self.recording.finish().expect("finalize call");
+        assert_eq!(summary.end, RecordingEnd::Observed(TerminalKind::Terminate));
+        assert_eq!(fs::read(self.path.join("wire.bin")).expect("wire"), wire);
+        let wave = fs::read(self.path.join("audio.wav")).expect("wave");
+        assert_eq!(&wave[44..], pcm);
+        assert_eq!(&wave[40..44], &[0, 8, 0, 0]);
+        assert_eq!(&wave[4..8], &[36, 8, 0, 0]);
+        assert_eq!(summary.audio_bytes, 2048);
+        assert_eq!(
+            summary.wire_bytes,
+            u64::try_from(wire.len()).expect("wire length")
+        );
+        let text = fs::read_to_string(self.path.join("events.txt")).expect("events");
+        assert!(
+            text.lines()
+                .last()
+                .expect("terminal")
+                .ends_with("reason=terminate")
+        );
+        summary.wire_bytes
+    }
+}
+
+fn concurrent_fixture(sender: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut wire = vec![1, 0, 16];
+    wire.extend_from_slice(&[sender; 16]);
+    let mut pcm = Vec::new();
+    for sample in 0_u8..32 {
+        let mut payload = [0_u8; 64];
+        for pair in payload.as_chunks_mut::<2>().0 {
+            pair.copy_from_slice(&[sample, sender]);
+        }
+        wire.extend_from_slice(&[0x10, 0, 64]);
+        wire.extend_from_slice(&payload);
+        pcm.extend_from_slice(&payload);
+    }
+    wire.extend_from_slice(&[0, 0, 0]);
+    (wire, pcm)
+}
+
+fn concurrent_calls(turns: usize) {
+    use std::collections::BTreeMap;
+    let directory = Directory::new();
+    let budget = ByteBudget::new(NonZeroUsize::new(4096).expect("budget"));
+    let limits = Limits::new(
+        NonZeroUsize::new(2).expect("connections"),
+        NonZeroUsize::MIN,
+        NonZeroU16::new(64).expect("payload"),
+        NonZeroUsize::new(turns).expect("turns"),
+    )
+    .expect("limits");
+    let (receiver, records, stop) = Receiver::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        limits,
+        budget.clone(),
+    )
+    .expect("bind");
+    let local = receiver.local_addr();
+    let worker = thread::spawn(move || receiver.run());
+    let mut senders = Vec::new();
+    let mut start_commands = Vec::new();
+    for sender in [1, 2] {
+        let mut peer = TcpStream::connect(local).expect("connect");
+        let (start, permission) = mpsc::sync_channel(1);
+        start_commands.push(start);
+        senders.push(thread::spawn(move || {
+            permission.recv_timeout(WAIT).expect("both peers connected");
+            peer.write_all(&concurrent_fixture(sender).0)
+                .expect("whole offered stream");
+        }));
+    }
+    for command in start_commands {
+        command.send(()).expect("release connected sender");
+    }
+    let mut calls = BTreeMap::new();
+    let mut completed = 0;
+    let mut wire = 0;
+    let deadline = std::time::Instant::now() + WAIT;
+    while completed != 2 {
+        let record = records
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("concurrent receiver progress");
+        if matches!(record.kind, RecordKind::Connected { .. }) {
+            assert!(
+                calls
+                    .insert(record.connection, CallOutput::new(&record, &directory))
+                    .is_none()
+            );
+        }
+        let call = calls
+            .get_mut(&record.connection)
+            .expect("admitted identity");
+        if let RecordKind::Started { uuid } = record.kind {
+            let sender = uuid.bytes()[0];
+            assert!([1, 2].contains(&sender));
+            assert_eq!(uuid.bytes(), [sender; 16]);
+            call.sender = Some(sender);
+        }
+        call.recording
+            .record(&record)
+            .expect("ordered connection observation");
+        if matches!(record.kind, RecordKind::Ended { .. }) {
+            wire += calls
+                .remove(&record.connection)
+                .expect("completed call")
+                .finish();
+            completed += 1;
+        }
+    }
+    for sender in senders {
+        sender.join().expect("sender completes");
+    }
+    stop.stop().expect("stop worker");
+    let summary = worker
+        .join()
+        .expect("worker completes")
+        .expect("worker result");
+    assert_eq!(summary.accepted, 2);
+    assert_eq!(summary.ended, 2);
+    assert_eq!(summary.abandoned, 0);
+    assert_eq!(summary.raw_bytes_read, wire);
+    assert_eq!(summary.raw_bytes_handed_off, wire);
+    assert_eq!(summary.undelivered_records, 0);
+    assert_eq!(summary.undelivered_raw_bytes, 0);
+    assert!(summary.counters_complete);
+    drop(records);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn concurrent_calls_preserve_exact_files_with_one_slot_and_shared_bytes() {
+    for turns in [1, 8, 128] {
+        concurrent_calls(turns);
+    }
+}
