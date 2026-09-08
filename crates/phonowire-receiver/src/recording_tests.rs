@@ -360,3 +360,57 @@ fn accepted_prefixes_then_io_error_and_interrupted_short_writes_are_exact() {
     assert_eq!(error.stage(), RecordingStage::Patch);
     assert_eq!(error.summary().patch_bytes, 1);
 }
+
+#[test]
+fn owned_buffered_writer_may_write_on_drop_without_finalization() {
+    for failed_finish in [false, true] {
+        let wave = Shared::default();
+        let mut recording = Recording::new(
+            id(),
+            Shared::default(),
+            io::BufWriter::with_capacity(1024, wave.clone()),
+            Shared::default(),
+        )
+        .expect("buffered provisional header");
+        assert!(wave.bytes().is_empty());
+        if failed_finish {
+            recording
+                .record(&record(0, RecordKind::Started { uuid: uuid() }))
+                .expect_err("no connection yet");
+            let error = recording
+                .finish()
+                .expect_err("failed state cannot finalize");
+            assert_eq!(error.stage(), RecordingStage::Validate);
+            assert_eq!(error.summary().patch_bytes, 0);
+        } else {
+            drop(recording);
+        }
+        assert_eq!(wave.bytes().len(), 44);
+        assert_eq!(&wave.bytes()[40..44], &[0, 0, 0, 0]);
+    }
+}
+
+#[test]
+fn borrowed_buffered_writer_outlives_drop_and_failed_finish() {
+    for failed_finish in [false, true] {
+        let wave = Shared::default();
+        let mut buffered = io::BufWriter::with_capacity(1024, wave.clone());
+        let mut recording =
+            Recording::new(id(), Shared::default(), &mut buffered, Shared::default())
+                .expect("buffered provisional header");
+        if failed_finish {
+            recording
+                .record(&record(0, RecordKind::Started { uuid: uuid() }))
+                .expect_err("no connection yet");
+            recording
+                .finish()
+                .expect_err("failed state cannot finalize");
+        } else {
+            drop(recording);
+        }
+        assert!(wave.bytes().is_empty());
+        assert_eq!(buffered.buffer().len(), 44);
+        drop(buffered);
+        assert_eq!(wave.bytes().len(), 44);
+    }
+}

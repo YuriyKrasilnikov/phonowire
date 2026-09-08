@@ -200,7 +200,10 @@ enum State {
 /// Supply empty writers positioned at zero. The adapter borrows each `Record`;
 /// payload retention ends when the caller drops that record. Blocking writes run
 /// on the consumer, independently of the receiver worker. Failure stops further
-/// mutations. Dropping the adapter does not finalize or flush its outputs.
+/// mutations. The adapter itself neither finalizes nor calls `flush` on drop.
+/// Destructors of writers passed by value may perform their own I/O, including
+/// after an unsuccessful [`Self::finish`]. Pass writers by `&mut` to retain
+/// control of their lifetimes.
 pub struct Recording<Wire: Write, Wave: Write + Seek, Events: Write> {
     id: ConnectionId,
     wire: Wire,

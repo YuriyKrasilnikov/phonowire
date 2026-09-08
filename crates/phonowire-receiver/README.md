@@ -107,8 +107,10 @@ Each output failure identifies its stage and the exact bytes accepted before
 failure, including initial or replacement header prefixes. Later calls cannot
 mutate a failed recording. Finalization seeks, writes the final header, and
 flushes all three outputs; any failure returns an error. Dropping a recorder does
-not finalize it. Successful writes and flushes do not promise filesystem `fsync`
-or persistence across power loss.
+not finalize it or explicitly flush its outputs. Destructors of owned writers
+may perform their own I/O, including after failed `finish`; pass writers by
+`&mut` to keep control of their lifetimes. Successful writes and flushes do not
+promise filesystem `fsync` or persistence across power loss.
 
 Run a self-contained localhost call through the receiver and recorder:
 
