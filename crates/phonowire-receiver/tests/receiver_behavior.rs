@@ -3,9 +3,9 @@ use std::io::Write;
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use phonowire_receiver::{ByteBudget, EndReason, Limits, Receiver, RecordKind};
+use phonowire_receiver::{ByteBudget, EndReason, Limits, Receiver, RecordKind, Records};
 
 fn limits(slots: usize, turns: usize) -> Limits {
     Limits::new(
@@ -15,6 +15,12 @@ fn limits(slots: usize, turns: usize) -> Limits {
         NonZeroUsize::new(turns).expect("turn limit"),
     )
     .expect("valid limits")
+}
+
+fn next_record(records: &Records, deadline: Instant) -> phonowire_receiver::Record {
+    records
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .expect("record before deadline")
 }
 
 #[test]
@@ -34,18 +40,29 @@ fn fragmented_uuid_audio_and_terminate_preserve_raw_before_events() {
     peer.write_all(&bytes[19..]).expect("fragment three");
     peer.flush().expect("flush");
 
-    let mut raw = 0_usize;
+    let mut raw = Vec::new();
     let mut started = false;
     let mut audio = false;
     let mut ended = false;
-    for _ in 0..8 {
-        let record = records
-            .recv_timeout(Duration::from_secs(2))
-            .expect("record");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let record = next_record(&records, deadline);
         match record.kind {
-            RecordKind::Wire { bytes } => raw += bytes.as_slice().len(),
-            RecordKind::Started { .. } => started = true,
+            RecordKind::Wire { bytes } => {
+                assert_eq!(
+                    record.offset.get(),
+                    u64::try_from(raw.len()).expect("offset")
+                );
+                raw.extend_from_slice(bytes.as_slice());
+            }
+            RecordKind::Started { .. } => {
+                assert!(raw.len() >= 19);
+                assert_eq!(record.offset.get(), 19);
+                started = true;
+            }
             RecordKind::Audio { bytes, .. } => {
+                assert!(started && raw.len() >= 24);
+                assert_eq!(record.offset.get(), 24);
                 audio = bytes.as_slice() == [0, 0];
             }
             RecordKind::Ended {
@@ -58,7 +75,7 @@ fn fragmented_uuid_audio_and_terminate_preserve_raw_before_events() {
             RecordKind::Connected { .. } | RecordKind::Dtmf { .. } | RecordKind::Ended { .. } => {}
         }
     }
-    assert_eq!(raw, bytes.len());
+    assert_eq!(raw, bytes);
     assert!(started);
     assert!(audio);
     assert!(ended);
@@ -88,10 +105,9 @@ fn eof_after_uuid_retains_identity_in_clean_terminal_record() {
     .expect("uuid");
     peer.shutdown(Shutdown::Write).expect("eof");
     let mut clean_uuid = false;
-    for _ in 0..4 {
-        let record = records
-            .recv_timeout(Duration::from_secs(2))
-            .expect("record");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let record = next_record(&records, deadline);
         if let RecordKind::Ended {
             uuid: Some(_),
             reason: EndReason::CleanEof,
@@ -123,10 +139,9 @@ fn policy_rejection_after_uuid_retains_identity() {
     ])
     .expect("frames");
     let mut policy_uuid = false;
-    for _ in 0..5 {
-        let record = records
-            .recv_timeout(Duration::from_secs(2))
-            .expect("record");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let record = next_record(&records, deadline);
         if let RecordKind::Ended {
             uuid: Some(_),
             reason: EndReason::Policy(_),
@@ -161,55 +176,86 @@ fn one_slot_queue_resumes_after_consumer_credit_while_peer_is_silent() {
         .recv_timeout(Duration::from_secs(2))
         .expect("connected");
     assert!(matches!(connected.kind, RecordKind::Connected { .. }));
-    // No more writes occur: the queued wire and start records require only this credit.
-    let wire = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("wire after credit");
-    assert!(matches!(wire.kind, RecordKind::Wire { .. }));
-    let started = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("started after credit");
-    assert!(matches!(started.kind, RecordKind::Started { .. }));
+    // Wire may consist of several read chunks; every receive returns a slot.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut raw = Vec::new();
+    loop {
+        let record = next_record(&records, deadline);
+        match record.kind {
+            RecordKind::Wire { bytes } => {
+                assert_eq!(
+                    record.offset.get(),
+                    u64::try_from(raw.len()).expect("offset")
+                );
+                raw.extend_from_slice(bytes.as_slice());
+            }
+            RecordKind::Started { .. } => break,
+            other => panic!("unexpected event before UUID: {other:?}"),
+        }
+    }
+    assert_eq!(
+        raw,
+        [
+            0x01, 0x00, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]
+    );
     stop.stop().expect("stop wake");
     worker.join().expect("worker thread").expect("worker run");
 }
 
 #[test]
-fn retained_raw_record_releases_byte_credit_without_another_tcp_write() {
+fn full_byte_budget_resumes_without_another_tcp_write() {
     let budget = ByteBudget::new(NonZeroUsize::new(4096).expect("budget"));
+    let retained = budget.try_copy(&[0; 4096]).expect("fill byte budget");
     let (receiver, records, stop) = Receiver::bind(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         limits(16, 8),
-        budget,
+        budget.clone(),
     )
     .expect("bind");
     let local = receiver.local_addr();
     let worker = thread::spawn(move || receiver.run());
     let mut peer = TcpStream::connect(local).expect("connect");
-    let mut bytes = vec![0_u8; 4096];
-    bytes[..24].copy_from_slice(&[
+    let bytes = [
         0x01, 0x00, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 0x00, 0x02, 0, 0,
-    ]);
-    peer.write_all(&bytes).expect("one full read");
-    let _connected = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("connected");
-    let retained = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("raw record");
-    assert!(matches!(retained.kind, RecordKind::Wire { .. }));
-    let _started = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("started");
+        0, 0, 0,
+    ];
+    peer.write_all(&bytes).expect("send once");
     assert!(matches!(
-        records.recv_timeout(Duration::from_millis(50)),
+        next_record(&records, Instant::now() + Duration::from_secs(2)).kind,
+        RecordKind::Connected { .. }
+    ));
+    assert_eq!(budget.used(), 4096);
+    assert!(matches!(
+        records.recv_timeout(Duration::from_millis(30)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout)
     ));
+    // Full capacity is established by the owned allocation, independently of TCP reads.
     drop(retained);
-    let audio = records
-        .recv_timeout(Duration::from_secs(2))
-        .expect("audio after byte credit");
-    assert!(matches!(audio.kind, RecordKind::Audio { .. }));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut raw = Vec::new();
+    let mut audio = Vec::new();
+    loop {
+        let record = next_record(&records, deadline);
+        match record.kind {
+            RecordKind::Wire { bytes } => {
+                assert_eq!(
+                    record.offset.get(),
+                    u64::try_from(raw.len()).expect("offset")
+                );
+                raw.extend_from_slice(bytes.as_slice());
+            }
+            RecordKind::Audio { bytes, .. } => audio.extend_from_slice(bytes.as_slice()),
+            RecordKind::Started { .. } => {}
+            RecordKind::Ended {
+                reason: EndReason::Terminate,
+                ..
+            } => break,
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+    assert_eq!(raw, bytes);
+    assert_eq!(audio, [0, 0]);
     stop.stop().expect("stop wake");
     worker.join().expect("worker thread").expect("worker run");
 }
@@ -239,10 +285,9 @@ fn quota_one_admits_two_concurrent_uuid_streams() {
         .expect("second uuid");
     let mut first_seen = false;
     let mut second_seen = false;
-    for _ in 0..8 {
-        let record = records
-            .recv_timeout(Duration::from_secs(2))
-            .expect("record");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let record = next_record(&records, deadline);
         if let RecordKind::Started { uuid } = record.kind {
             first_seen |= uuid.bytes()[0] == 1;
             second_seen |= uuid.bytes()[0] == 2;
@@ -257,7 +302,7 @@ fn quota_one_admits_two_concurrent_uuid_streams() {
 }
 
 #[test]
-fn stop_cancels_task_waiting_behind_a_full_handoff_slot() {
+fn stop_cancels_an_accepted_task_without_assuming_its_wait_state() {
     let budget = ByteBudget::new(NonZeroUsize::new(8192).expect("budget"));
     let (receiver, records, stop) = Receiver::bind(
         SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -276,7 +321,7 @@ fn stop_cancels_task_waiting_behind_a_full_handoff_slot() {
         .recv_timeout(Duration::from_secs(2))
         .expect("connected");
     assert!(matches!(connected.kind, RecordKind::Connected { .. }));
-    // The silent peer has no more bytes; Wire occupies the sole slot and Started is pending.
+    // Connected establishes admission, but does not establish a pending Queue wait.
     stop.stop().expect("stop wake");
     let summary = worker.join().expect("worker thread").expect("worker run");
     assert_eq!(
@@ -284,5 +329,15 @@ fn stop_cancels_task_waiting_behind_a_full_handoff_slot() {
         Some(phonowire_receiver::StopCause::Requested)
     );
     assert_eq!(summary.abandoned, 1);
-    assert!(summary.undelivered_records >= 1);
+    assert_eq!(summary.accepted, 1);
+    assert!(summary.undelivered_records <= summary.abandoned);
+    assert_eq!(
+        summary.raw_bytes_read,
+        summary.raw_bytes_handed_off + summary.undelivered_raw_bytes
+    );
+    let mut queued = 0_u64;
+    while records.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(summary.records_handed_off, queued + 1);
 }

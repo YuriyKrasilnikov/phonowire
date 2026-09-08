@@ -13,6 +13,10 @@ use std::time::Instant;
 
 /// Runs one socket's persistent decoder and session state until its terminal outcome.
 pub async fn receive(mut socket: TcpStream, payload_capacity: usize, context: TaskContext) {
+    receive_from(&mut socket, payload_capacity, context).await;
+}
+
+async fn receive_from<R: Read>(mut socket: R, payload_capacity: usize, context: TaskContext) {
     let mut scratch = vec![0; payload_capacity].into_boxed_slice();
     let mut decoder = RawDecoder::new(&mut scratch);
     let mut session = IncomingSession::new();
@@ -158,8 +162,8 @@ async fn decode_chunk(
     true
 }
 
-async fn read_once(
-    socket: &mut TcpStream,
+async fn read_once<R: Read>(
+    socket: &mut R,
     read: &mut [u8; READ_BYTES],
     context: &TaskContext,
 ) -> io::Result<usize> {
@@ -301,3 +305,7 @@ async fn send_at(
         .await
         .is_ok()
 }
+
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod tests;

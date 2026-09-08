@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use phonowire_receiver::{ByteBudget, Limits, READ_BYTES, Receiver, ReceiverFailure, RecordKind};
 
@@ -33,19 +33,30 @@ fn old_output_remains_charged_and_wakes_a_replacement_worker() {
     let (receiver, records, stop) =
         Receiver::bind(address(), limits(), budget.clone()).expect("bind");
     let mut peer = TcpStream::connect(receiver.local_addr()).expect("first connection");
-    let mut stream = [0_u8; READ_BYTES];
-    stream[..UUID_FRAME.len()].copy_from_slice(&UUID_FRAME);
-    peer.write_all(&stream)
-        .expect("queue one full read chunk before run");
+    let stream = UUID_FRAME;
+    peer.write_all(&stream).expect("queue UUID before run");
     let worker = thread::spawn(move || receiver.run());
     let connected = records.recv_timeout(DEADLINE).expect("connected");
     assert!(matches!(connected.kind, RecordKind::Connected { .. }));
     let old_id = connected.connection;
-    let first = records.recv_timeout(DEADLINE).expect("raw observation");
-    let RecordKind::Wire { bytes: retained } = first.kind else {
-        panic!("raw precedes decoded events");
-    };
-    assert_eq!(retained.as_slice(), stream);
+    let deadline = Instant::now() + DEADLINE;
+    let mut retained = Vec::new();
+    let mut raw = Vec::new();
+    while raw.len() < stream.len() {
+        let first = records
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("raw observation");
+        let RecordKind::Wire { bytes } = first.kind else {
+            panic!("all UUID wire precedes its decoded event");
+        };
+        assert_eq!(
+            first.offset.get(),
+            u64::try_from(raw.len()).expect("offset")
+        );
+        raw.extend_from_slice(bytes.as_slice());
+        retained.push(bytes);
+    }
+    assert_eq!(raw, stream);
     stop.stop().expect("stop first worker");
     let summary = worker
         .join()
@@ -53,8 +64,11 @@ fn old_output_remains_charged_and_wakes_a_replacement_worker() {
         .expect("worker result");
     drop(records);
     drop(peer);
-    assert_eq!(summary.retained_output_bytes, READ_BYTES);
-    assert_eq!(budget.used(), READ_BYTES);
+    assert_eq!(summary.retained_output_bytes, UUID_FRAME.len());
+    assert_eq!(budget.used(), UUID_FRAME.len());
+    let padding = budget
+        .try_copy(&vec![0; READ_BYTES - UUID_FRAME.len()])
+        .expect("saturate exact remaining capacity");
 
     let (receiver, records, stop) =
         Receiver::bind(address(), limits(), budget.clone()).expect("rebind");
@@ -72,21 +86,26 @@ fn old_output_remains_charged_and_wakes_a_replacement_worker() {
     ));
     assert_eq!(budget.used(), READ_BYTES);
     drop(retained);
-    let raw = records
-        .recv_timeout(DEADLINE)
-        .expect("old storage release wakes new worker");
-    let RecordKind::Wire { bytes } = raw.kind else {
-        panic!("wire follows credit");
-    };
-    assert_eq!(bytes.as_slice(), UUID_FRAME);
-    drop(bytes);
-    assert!(matches!(
-        records
-            .recv_timeout(DEADLINE)
-            .expect("UUID interpreted")
-            .kind,
-        RecordKind::Started { .. }
-    ));
+    let deadline = Instant::now() + DEADLINE;
+    let mut raw = Vec::new();
+    loop {
+        let record = records
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("old storage release wakes new worker");
+        match record.kind {
+            RecordKind::Wire { bytes } => {
+                assert_eq!(
+                    record.offset.get(),
+                    u64::try_from(raw.len()).expect("offset")
+                );
+                raw.extend_from_slice(bytes.as_slice());
+            }
+            RecordKind::Started { .. } => break,
+            other => panic!("unexpected record: {other:?}"),
+        }
+    }
+    assert_eq!(raw, UUID_FRAME);
+    drop(padding);
     stop.stop().expect("stop replacement");
     worker
         .join()
