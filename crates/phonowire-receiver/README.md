@@ -62,6 +62,33 @@ interpretation.
 The receiver handles plaintext incoming TCP. TLS, WebSocket, reverse playback and
 completion-based I/O require their own adapters and lifecycle contracts.
 
+## Recording a connection
+
+`Recording::new` accepts one connection identity and three caller-owned writers:
+exact observed wire bytes, mono 8 kHz PCM16LE WAVE, and diagnostic text. Supply
+empty outputs positioned at zero. The WAVE writer also implements `Seek` so
+`finish` can replace its provisional sizes. Feed records in their delivered
+order with `record(&record)`, then drop each owned record to return byte credit.
+The adapter never holds a record or writes from the network worker.
+
+The WAVE contains accepted audio only; the wire output also preserves malformed,
+control and uninterpreted bytes observed by the receiver. Diagnostics describe
+identity, offsets, receiver observation times and terminal/error metadata without
+duplicating payloads. They are human-readable text, not a versioned interchange
+protocol. Receiver observation time does not establish source capture time.
+
+`finish` reports `RecordingEnd::Incomplete` when no terminal record was received.
+A received error or truncation remains an error class in the summary even if its
+accepted PCM prefix was finalized successfully. RIFF size overflow is refused
+before adding the offending audio; there is no automatic format substitution.
+
+Each output failure identifies its stage and the exact bytes accepted before
+failure, including initial or replacement header prefixes. Later calls cannot
+mutate a failed recording. Finalization seeks, writes the final header, and
+flushes all three outputs; any failure returns an error. Dropping a recorder does
+not finalize it. Successful writes and flushes do not promise filesystem `fsync`
+or persistence across power loss.
+
 ## License
 
 Apache License 2.0. Copyright Yuriy Krasilnikov. See `LICENSE` and `NOTICE`.

@@ -10,6 +10,7 @@ mod driver;
 mod handoff;
 mod memory;
 mod record;
+mod recording;
 mod scheduler;
 
 pub use config::{Limits, LimitsError, READ_BYTES};
@@ -17,3 +18,8 @@ pub use driver::{Receiver, ReceiverError, ReceiverFailure, RunSummary, StopCause
 pub use handoff::Records;
 pub use memory::{BudgetError, ByteBudget, OwnedBytes};
 pub use record::{ConnectionId, EndReason, Record, RecordKind, WireOffset};
+
+pub use recording::{
+    Recording, RecordingEnd, RecordingError, RecordingFailure, RecordingStage, RecordingSummary,
+    RecordingViolation, TerminalKind,
+};

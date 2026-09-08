@@ -60,6 +60,10 @@ The receiver reports abandoned work at cancellation and keeps retained data
 charged across worker restarts. These resource bounds are not a measured call
 capacity or a peer interoperability certification.
 
+`Recording` consumes one connection's records into exact wire bytes, accepted
+PCM WAVE audio and diagnostic text. Finalization preserves terminal meaning;
+writer failures report their stage and confirmed output prefixes.
+
 ## Repository layout
 
 ```text
