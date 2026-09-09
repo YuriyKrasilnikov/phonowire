@@ -87,6 +87,13 @@ writer failures report their stage and confirmed output prefixes.
 The [recording example](crates/phonowire-receiver/examples/record_incoming.rs)
 executes a literal localhost call through both components.
 
+## Capture application
+
+The maintained `phonowire-capture` CLI receives generic incoming AudioSocket
+connections into bounded create-new output directories. Run it from source with
+`cargo run -p phonowire-capture -- --output ./captures`; see the
+[capture contract](docs/capture.md) for limits and shutdown behavior.
+
 ## Repository layout
 
 ```text

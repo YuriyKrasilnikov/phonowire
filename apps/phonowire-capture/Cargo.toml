@@ -1,0 +1,19 @@
+[package]
+name = "phonowire-capture"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Bounded incoming AudioSocket recording CLI"
+publish = false
+
+[dependencies]
+phonowire-receiver = { path = "../../crates/phonowire-receiver" }
+signal-hook = "=0.3.18"
+
+[dev-dependencies]
+serde_json = "=1.0.151"
+
+[lints]
+workspace = true

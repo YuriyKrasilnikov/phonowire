@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/phonowire-audiosocket", "crates/phonowire-receiver"]
+members = ["crates/phonowire-audiosocket", "crates/phonowire-receiver", "apps/phonowire-capture"]
 resolver = "3"
 
 [workspace.package]
