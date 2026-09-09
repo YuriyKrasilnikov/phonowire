@@ -59,6 +59,12 @@ pub enum ReceiverFailure {
 /// Byte retention is a snapshot after connection tasks have been destroyed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunSummary {
+    /// Retryable transient accept errors observed during this run.
+    pub transient_accept_errors: u64,
+    /// Resource-pressure accept pauses entered during this run.
+    pub resource_pause_entries: u64,
+    /// All-retry bounded turns that installed an accept cooldown.
+    pub retry_quota_backoffs: u64,
     /// Connections admitted to the worker.
     pub accepted: usize,
     /// Accepted sockets closed because the live connection bound was full.
@@ -92,6 +98,9 @@ pub struct RunSummary {
 impl Default for RunSummary {
     fn default() -> Self {
         Self {
+            transient_accept_errors: 0,
+            resource_pause_entries: 0,
+            retry_quota_backoffs: 0,
             accepted: 0,
             refused: 0,
             ended: 0,
@@ -573,8 +582,19 @@ impl Worker {
                         self.listener_ready = false;
                         return Ok(());
                     }
-                    AcceptFailure::Retry => {}
+                    AcceptFailure::Retry => {
+                        self.summary.transient_accept_errors = self
+                            .summary
+                            .transient_accept_errors
+                            .checked_add(1)
+                            .ok_or(ReceiverFailure::CounterExhausted)?;
+                    }
                     AcceptFailure::Pause => {
+                        self.summary.resource_pause_entries = self
+                            .summary
+                            .resource_pause_entries
+                            .checked_add(1)
+                            .ok_or(ReceiverFailure::CounterExhausted)?;
                         self.accept_paused_at = Some(accept.now());
                         return Ok(());
                     }
@@ -583,6 +603,11 @@ impl Worker {
             }
         }
         if !progressed {
+            self.summary.retry_quota_backoffs = self
+                .summary
+                .retry_quota_backoffs
+                .checked_add(1)
+                .ok_or(ReceiverFailure::CounterExhausted)?;
             self.accept_paused_at = Some(accept.now());
         }
         Ok(())

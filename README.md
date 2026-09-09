@@ -142,5 +142,9 @@ The package command above verifies the codec archive. Receiver use from the
 source workspace is separate from registry packaging: its sibling codec must
 also be available when resolving a normalized receiver package.
 
+## Receiver run summary
+
+`RunSummary` includes final-only accept-pressure counters: retryable errors, resource pause entries, and retry-quota backoffs. Adding these public fields is source-breaking for downstream exhaustive struct literals; consumers should construct with `RunSummary::default()` and update named fields where needed.
+
 Licensed under [Apache-2.0](LICENSE).
 Copyright 2026 Yuriy Krasilnikov; see [NOTICE](NOTICE).

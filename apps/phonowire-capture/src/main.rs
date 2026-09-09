@@ -616,8 +616,8 @@ fn run(c: &Config) -> Result<(), String> {
 }
 fn receiver_json(s: Option<RunSummary>) -> String {
     s.map_or_else(|| "null".into(), |x| format!(
-        "{{\"accepted\":{},\"refused\":{},\"ended\":{},\"abandoned\":{},\"live\":{},\"raw_bytes_read\":{},\"raw_bytes_handed_off\":{},\"undelivered_raw_bytes\":{},\"records_handed_off\":{},\"undelivered_records\":{},\"retained_output_bytes\":{},\"fixed_buffer_capacity\":{},\"stopped_by\":\"{:?}\",\"counters_complete\":{}}}",
-        x.accepted, x.refused, x.ended, x.abandoned, x.live, x.raw_bytes_read,
+        "{{\"transient_accept_errors\":{},\"resource_pause_entries\":{},\"retry_quota_backoffs\":{},\"accepted\":{},\"refused\":{},\"ended\":{},\"abandoned\":{},\"live\":{},\"raw_bytes_read\":{},\"raw_bytes_handed_off\":{},\"undelivered_raw_bytes\":{},\"records_handed_off\":{},\"undelivered_records\":{},\"retained_output_bytes\":{},\"fixed_buffer_capacity\":{},\"stopped_by\":\"{:?}\",\"counters_complete\":{}}}",
+        x.transient_accept_errors, x.resource_pause_entries, x.retry_quota_backoffs, x.accepted, x.refused, x.ended, x.abandoned, x.live, x.raw_bytes_read,
         x.raw_bytes_handed_off, x.undelivered_raw_bytes, x.records_handed_off,
         x.undelivered_records, x.retained_output_bytes, x.fixed_buffer_capacity,
         x.stopped_by, x.counters_complete))

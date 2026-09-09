@@ -183,6 +183,11 @@ fn error_storm_attempts_obey_the_turn_budget_and_cooldown_despite_readiness() {
             for round in 1..=4 {
                 worker.accept_ready(&mut source).expect("retryable turn");
                 assert_eq!(source.attempts, round * bound);
+                assert_eq!(
+                    worker.summary.transient_accept_errors,
+                    (round * bound) as u64
+                );
+                assert_eq!(worker.summary.retry_quota_backoffs, round as u64);
                 assert_eq!(worker.poll_timeout(source.now), STOP_RECHECK);
                 source.now += STOP_RECHECK
                     .checked_sub(Duration::from_nanos(1))
@@ -212,6 +217,7 @@ fn resource_pressure_retries_one_attempt_per_pause_then_clears_on_would_block() 
         worker
             .accept_ready(&mut source)
             .expect("first resource failure");
+        assert_eq!(worker.summary.resource_pause_entries, 1);
         worker
             .accept_ready(&mut source)
             .expect("no immediate retry");
@@ -220,6 +226,7 @@ fn resource_pressure_retries_one_attempt_per_pause_then_clears_on_would_block() 
         worker
             .accept_ready(&mut source)
             .expect("second resource failure");
+        assert_eq!(worker.summary.resource_pause_entries, 2);
         assert_eq!(source.attempts, 2);
         source.now += STOP_RECHECK;
         worker.accept_ready(&mut source).expect("empty listener");
@@ -231,6 +238,36 @@ fn resource_pressure_retries_one_attempt_per_pause_then_clears_on_would_block() 
             .expect("WouldBlock awaits a new edge");
         assert_eq!(source.attempts, 3);
     }
+}
+
+#[test]
+fn accept_pressure_counters_exhaust_without_wrapping() {
+    let (mut retry, _records, _stop) = fixture(8);
+    retry.summary.transient_accept_errors = u64::MAX;
+    let mut retry_source = Sequence::new([libc::EINTR]);
+    assert!(matches!(
+        retry.accept_ready(&mut retry_source),
+        Err(ReceiverFailure::CounterExhausted)
+    ));
+    assert_eq!(retry.summary.transient_accept_errors, u64::MAX);
+
+    let (mut pause, _records, _stop) = fixture(8);
+    pause.summary.resource_pause_entries = u64::MAX;
+    let mut pause_source = Sequence::new([libc::EMFILE]);
+    assert!(matches!(
+        pause.accept_ready(&mut pause_source),
+        Err(ReceiverFailure::CounterExhausted)
+    ));
+    assert_eq!(pause.summary.resource_pause_entries, u64::MAX);
+
+    let (mut quota, _records, _stop) = fixture(1);
+    quota.summary.retry_quota_backoffs = u64::MAX;
+    let mut quota_source = Sequence::new([libc::EINTR]);
+    assert!(matches!(
+        quota.accept_ready(&mut quota_source),
+        Err(ReceiverFailure::CounterExhausted)
+    ));
+    assert_eq!(quota.summary.retry_quota_backoffs, u64::MAX);
 }
 
 #[test]
