@@ -1,8 +1,5 @@
 # Phonowire
 
-[Phonowire](https://github.com/YuriyKrasilnikov/phonowire) is a source-first
-Rust workspace for bounded AudioSocket protocol handling on Linux.
-
 Portable protocol components for telephony applications, starting with
 AudioSocket. The `phonowire-audiosocket` crate provides allocation-free,
 `no_std` framing and incoming-session policy with no external dependencies.
