@@ -1,5 +1,8 @@
 # Phonowire
 
+[Phonowire](https://github.com/YuriyKrasilnikov/phonowire) is a source-first
+Rust workspace for bounded AudioSocket protocol handling on Linux.
+
 Portable protocol components for telephony applications, starting with
 AudioSocket. The `phonowire-audiosocket` crate provides allocation-free,
 `no_std` framing and incoming-session policy with no external dependencies.
@@ -70,6 +73,11 @@ the receiver when naming its public types, such as `Uuid` or `SampleRate`; use
 both crates from the same checkout. The receiver itself already depends on the
 codec. The workspace lockfile fixes this repository's dependency resolution;
 an independent application manages its own lockfile.
+
+Dependency direction is intentional: `phonowire-audiosocket` is the portable
+codec; `phonowire-receiver` depends on that codec for Linux TCP reception; and
+`phonowire-capture` depends on the receiver to write bounded diagnostic
+recordings. Applications depend on the lowest layer that meets their needs.
 
 ## TCP reception
 

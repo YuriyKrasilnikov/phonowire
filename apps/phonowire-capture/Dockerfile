@@ -1,4 +1,4 @@
-# Official bookworm bootstrap pinned to the reviewed linux/amd64 manifest.
+# Official bookworm bootstrap pinned to a linux/amd64 manifest.
 FROM rust:1-bookworm@sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
