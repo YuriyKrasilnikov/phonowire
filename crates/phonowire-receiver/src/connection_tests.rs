@@ -3,6 +3,7 @@ use super::*;
 use crate::scheduler::{Scheduler, Signal, Signals, TaskResources};
 use crate::{ByteBudget, ConnectionId, Records};
 use mio::Token;
+use phonowire_audiosocket::IncomingProfile;
 use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -73,7 +74,12 @@ fn held_wire_blocks_audio_copy_until_last_drop_without_more_input() {
     let _subscription = budget
         .subscribe(test.signals.waker(Signal::Bytes))
         .expect("subscription");
-    let mut future = Box::pin(receive_from(Cursor::new(FRAME), 64, test.context.clone()));
+    let mut future = Box::pin(receive_from(
+        Cursor::new(FRAME),
+        64,
+        IncomingProfile::PCM_8_KHZ,
+        test.context.clone(),
+    ));
     assert!(test.poll(future.as_mut()).is_pending());
     assert_eq!(test.context.progress().read, 27);
     assert_eq!(test.context.progress().consumed, 24);
@@ -121,7 +127,12 @@ fn held_wire_blocks_audio_copy_until_last_drop_without_more_input() {
 fn full_queue_retains_one_pending_record_until_cancellation() {
     let budget = ByteBudget::new(NonZeroUsize::new(4096).expect("budget"));
     let test = Harness::new(1, budget.clone());
-    let mut future = Box::pin(receive_from(Cursor::new(FRAME), 64, test.context.clone()));
+    let mut future = Box::pin(receive_from(
+        Cursor::new(FRAME),
+        64,
+        IncomingProfile::PCM_8_KHZ,
+        test.context.clone(),
+    ));
     assert!(test.poll(future.as_mut()).is_pending());
     assert!(test.context.progress().pending_record);
     assert_eq!(test.context.progress().records_queued, 1);
@@ -164,6 +175,7 @@ fn controlled_read_sizes_preserve_wire_pcm_offsets_and_end() {
                 cap,
             },
             64,
+            IncomingProfile::PCM_8_KHZ,
             test.context.clone(),
         ));
         let mut raw = Vec::new();

@@ -19,6 +19,7 @@ use crate::scheduler::{
     Progress, Scheduler, Signal, Signals, TaskContext, TaskResources, WaitReason,
 };
 use crate::{BudgetError, ByteBudget, ConnectionId, Limits, Records};
+use phonowire_audiosocket::IncomingProfile;
 
 const LISTENER: Token = Token(0);
 const CONTROL: Token = Token(1);
@@ -212,7 +213,7 @@ impl Drop for StopHandle {
 /// A bound listener whose mutable connection tasks are created by [`Self::run`].
 ///
 /// The receiver can move to a caller-owned thread before execution. It accepts
-/// incoming plaintext `AudioSocket` with the codec's 8 kHz session policy.
+/// incoming plaintext `AudioSocket` with its documented wire-rate policy.
 pub struct Receiver {
     listener: TcpListener,
     local: SocketAddr,
@@ -221,6 +222,7 @@ pub struct Receiver {
     signals: Arc<Signals>,
     sender: RecordSender,
     instance: u64,
+    profile: IncomingProfile,
 }
 
 impl Receiver {
@@ -234,6 +236,23 @@ impl Receiver {
         address: SocketAddr,
         limits: Limits,
         budget: ByteBudget,
+    ) -> Result<(Self, Records, StopHandle), ReceiverError> {
+        Self::bind_with_profile(address, limits, budget, IncomingProfile::ALL_KNOWN_RATES)
+    }
+
+    /// Binds a listener with an explicit accepted-wire-rate profile.
+    ///
+    /// The profile controls policy admission only. Accepted records retain their
+    /// declared rate; the receiver never resamples PCM.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bind and capacity errors as [`Self::bind`].
+    pub fn bind_with_profile(
+        address: SocketAddr,
+        limits: Limits,
+        budget: ByteBudget,
+        profile: IncomingProfile,
     ) -> Result<(Self, Records, StopHandle), ReceiverError> {
         let required = crate::READ_BYTES.max(limits.payload_capacity());
         if budget.capacity() < required {
@@ -267,6 +286,7 @@ impl Receiver {
                 signals: Arc::clone(&signals),
                 sender,
                 instance,
+                profile,
             },
             records,
             StopHandle { signals },
@@ -321,6 +341,7 @@ impl Receiver {
             budget: self.budget,
             sender: self.sender,
             instance: self.instance,
+            profile: self.profile,
             live: BTreeMap::new(),
             next: FIRST_CONNECTION,
             listener_ready: true,
@@ -456,6 +477,7 @@ struct Worker {
     budget: ByteBudget,
     sender: RecordSender,
     instance: u64,
+    profile: IncomingProfile,
     live: BTreeMap<Token, Entry>,
     next: usize,
     listener_ready: bool,
@@ -637,6 +659,7 @@ impl Worker {
         let future = Box::pin(connection::receive(
             socket,
             self.limits.payload_capacity(),
+            self.profile,
             context.clone(),
         ));
         assert!(

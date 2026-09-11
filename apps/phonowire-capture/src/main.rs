@@ -1,4 +1,5 @@
 //! Bounded generic `AudioSocket` capture application.
+use phonowire_audiosocket::IncomingProfile;
 use phonowire_receiver::{
     ByteBudget, ConnectionId, Limits, Receiver, Record, RecordKind, Recording, RecordingEnd,
     RecordingError, RecordingFailure, RecordingStage, RecordingSummary, RunSummary, StopHandle,
@@ -390,7 +391,8 @@ fn run(c: &Config) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let budget = ByteBudget::new(NonZeroUsize::new(c.retained).ok_or("retained bytes is zero")?);
     let (receiver, records, stop) =
-        Receiver::bind(c.listen, limits, budget.clone()).map_err(|e| e.to_string())?;
+        Receiver::bind_with_profile(c.listen, limits, budget.clone(), IncomingProfile::PCM_8_KHZ)
+            .map_err(|e| e.to_string())?;
     let local_address = receiver.local_addr();
     let control = Arc::new(Control {
         stop: Arc::new(stop),

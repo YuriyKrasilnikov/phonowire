@@ -62,7 +62,7 @@ fn assert_literal_event(event: IncomingEvent<'_>, event_index: usize) {
                 reason: SessionEnd::Terminate,
             },
         ) => assert_eq!(uuid.bytes(), UUID),
-        (1, IncomingEvent::Audio { uuid, payload }) => {
+        (1, IncomingEvent::Audio { uuid, payload, .. }) => {
             assert_eq!(uuid.bytes(), UUID);
             assert_eq!(payload.bytes(), &[0x00, 0x80, 0xff, 0x7f]);
         }

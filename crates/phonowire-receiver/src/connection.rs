@@ -4,7 +4,7 @@ use crate::scheduler::{TaskContext, WaitReason};
 use crate::{EndReason, Record, RecordKind, WireOffset};
 use mio::net::TcpStream;
 use phonowire_audiosocket::{
-    DecodeOutcome, IncomingEvent, IncomingSession, RawDecoder, SampleRate, SessionEnd,
+    DecodeOutcome, IncomingEvent, IncomingProfile, IncomingSession, RawDecoder, SessionEnd,
 };
 use std::future::poll_fn;
 use std::io::{self, Read};
@@ -12,14 +12,24 @@ use std::task::Poll;
 use std::time::Instant;
 
 /// Runs one socket's persistent decoder and session state until its terminal outcome.
-pub async fn receive(mut socket: TcpStream, payload_capacity: usize, context: TaskContext) {
-    receive_from(&mut socket, payload_capacity, context).await;
+pub async fn receive(
+    mut socket: TcpStream,
+    payload_capacity: usize,
+    profile: IncomingProfile,
+    context: TaskContext,
+) {
+    receive_from(&mut socket, payload_capacity, profile, context).await;
 }
 
-async fn receive_from<R: Read>(mut socket: R, payload_capacity: usize, context: TaskContext) {
+async fn receive_from<R: Read>(
+    mut socket: R,
+    payload_capacity: usize,
+    profile: IncomingProfile,
+    context: TaskContext,
+) {
     let mut scratch = vec![0; payload_capacity].into_boxed_slice();
     let mut decoder = RawDecoder::new(&mut scratch);
-    let mut session = IncomingSession::new();
+    let mut session = IncomingSession::with_profile(profile);
     let mut read = [0_u8; READ_BYTES];
     if !send(
         &context,
@@ -202,17 +212,17 @@ async fn observe(context: &TaskContext, offset: u64, event: IncomingEvent<'_>) -
             )
             .await
         }
-        IncomingEvent::Audio { uuid, payload } => match context.copy(payload.bytes()).await {
+        IncomingEvent::Audio {
+            uuid,
+            rate,
+            payload,
+        } => match context.copy(payload.bytes()).await {
             Ok(bytes) => {
                 send_at(
                     context,
                     offset,
                     observed_at,
-                    RecordKind::Audio {
-                        uuid,
-                        rate: SampleRate::Khz8,
-                        bytes,
-                    },
+                    RecordKind::Audio { uuid, rate, bytes },
                 )
                 .await
             }

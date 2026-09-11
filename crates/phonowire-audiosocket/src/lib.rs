@@ -27,5 +27,7 @@ pub use encoder::{EncodeError, encode, encode_raw};
 pub use envelope::{RawEnvelope, RawEnvelopeError};
 pub use error::TypedMessageError;
 pub use message::{Dtmf, OpaquePayload, TypedMessage, Uuid};
-pub use session::{IncomingEvent, IncomingSession, IncomingSessionError, SessionEnd};
+pub use session::{
+    IncomingEvent, IncomingProfile, IncomingSession, IncomingSessionError, SessionEnd,
+};
 pub use wire_type::{KnownWireType, UnknownWireType, UnknownWireTypeError, WireType};

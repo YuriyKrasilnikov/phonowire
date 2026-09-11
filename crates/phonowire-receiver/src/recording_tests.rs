@@ -414,3 +414,31 @@ fn borrowed_buffered_writer_outlives_drop_and_failed_finish() {
         assert_eq!(wave.bytes().len(), 44);
     }
 }
+
+#[test]
+fn explicit_16khz_recorder_writes_a_truthful_wave_header() {
+    let wire = Shared::default();
+    let wave = Shared::default();
+    let events = Shared::default();
+    let mut recording =
+        Recording::with_sample_rate(id(), SampleRate::Khz16, wire, wave.clone(), events)
+            .expect("header");
+    recording.record(&connected()).expect("connected");
+    recording
+        .record(&record(0, RecordKind::Started { uuid: uuid() }))
+        .expect("started");
+    recording
+        .record(&record(
+            0,
+            RecordKind::Audio {
+                uuid: uuid(),
+                rate: SampleRate::Khz16,
+                bytes: owned(&[0, 0]),
+            },
+        ))
+        .expect("16 kHz audio");
+    recording.finish().expect("finish");
+    let header = wave.bytes();
+    assert_eq!(&header[24..28], &16_000_u32.to_le_bytes());
+    assert_eq!(&header[28..32], &32_000_u32.to_le_bytes());
+}

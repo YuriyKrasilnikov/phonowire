@@ -81,7 +81,7 @@ pub enum RecordKind {
         /// Accepted session UUID.
         uuid: Uuid,
     },
-    /// The session accepted 8 kHz PCM bytes.
+    /// The session accepted PCM bytes at their declared wire rate.
     Audio {
         /// Session UUID.
         uuid: Uuid,

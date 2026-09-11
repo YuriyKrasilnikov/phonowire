@@ -11,6 +11,7 @@ description = "Bounded incoming AudioSocket recording CLI"
 publish = false
 
 [dependencies]
+phonowire-audiosocket = { path = "../../crates/phonowire-audiosocket" }
 phonowire-receiver = { path = "../../crates/phonowire-receiver" }
 signal-hook = "=0.3.18"
 

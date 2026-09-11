@@ -14,15 +14,74 @@ pub enum SessionEnd<'a> {
     EndOfInput,
 }
 
+/// Explicit incoming media policy.
+///
+/// A caller may select individual documented rates. The default profile accepts
+/// every rate represented by the wire; this policy never resamples or changes
+/// the declared rate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncomingProfile {
+    accepted_rates: u16,
+}
+
+impl IncomingProfile {
+    /// A profile accepting only 8 kHz peers.
+    pub const PCM_8_KHZ: Self = Self { accepted_rates: 1 };
+    /// A profile accepting every rate represented by the `AudioSocket` wire type.
+    pub const ALL_KNOWN_RATES: Self = Self {
+        accepted_rates: (1 << 9) - 1,
+    };
+
+    /// Creates a profile from an explicit list of accepted wire rates.
+    #[must_use]
+    pub const fn from_rates(rates: &[SampleRate]) -> Self {
+        let mut accepted_rates = 0;
+        let mut index = 0;
+        while index < rates.len() {
+            accepted_rates |= rate_bit(rates[index]);
+            index += 1;
+        }
+        Self { accepted_rates }
+    }
+
+    /// Returns whether this profile accepts a declared wire rate.
+    #[must_use]
+    pub const fn accepts(self, rate: SampleRate) -> bool {
+        self.accepted_rates & rate_bit(rate) != 0
+    }
+}
+
+impl Default for IncomingProfile {
+    fn default() -> Self {
+        Self::ALL_KNOWN_RATES
+    }
+}
+
+const fn rate_bit(rate: SampleRate) -> u16 {
+    match rate {
+        SampleRate::Khz8 => 1 << 0,
+        SampleRate::Khz12 => 1 << 1,
+        SampleRate::Khz16 => 1 << 2,
+        SampleRate::Khz24 => 1 << 3,
+        SampleRate::Khz32 => 1 << 4,
+        SampleRate::Khz44_1 => 1 << 5,
+        SampleRate::Khz48 => 1 << 6,
+        SampleRate::Khz96 => 1 << 7,
+        SampleRate::Khz192 => 1 << 8,
+    }
+}
+
 /// An accepted incoming-session event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IncomingEvent<'a> {
     /// The first UUID established the session identity.
     Started(Uuid),
-    /// An 8 kHz PCM payload belonging to the established identity.
+    /// A PCM payload belonging to the established identity.
     Audio {
         /// The established protocol UUID.
         uuid: Uuid,
+        /// The rate declared by the received wire type.
+        rate: SampleRate,
         /// The original PCM payload.
         payload: AudioPayload<'a>,
     },
@@ -97,14 +156,22 @@ enum SessionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IncomingSession {
     state: SessionState,
+    profile: IncomingProfile,
 }
 
 impl IncomingSession {
     /// Creates a session that requires a UUID before media or DTMF.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_profile(IncomingProfile::ALL_KNOWN_RATES)
+    }
+
+    /// Creates a session with an explicit incoming media profile.
+    #[must_use]
+    pub const fn with_profile(profile: IncomingProfile) -> Self {
         Self {
             state: SessionState::AwaitingUuid,
+            profile,
         }
     }
 
@@ -123,7 +190,7 @@ impl IncomingSession {
     ///
     /// Returns a terminal [`IncomingSessionError`] for a rejected message or a
     /// message after this session has already ended.
-    pub fn receive<'a>(
+    pub const fn receive<'a>(
         &mut self,
         message: TypedMessage<'a>,
     ) -> Result<IncomingEvent<'a>, IncomingSessionError> {
@@ -165,7 +232,7 @@ impl IncomingSession {
         }
     }
 
-    fn audio<'a>(
+    const fn audio<'a>(
         &mut self,
         rate: SampleRate,
         payload: AudioPayload<'a>,
@@ -175,10 +242,14 @@ impl IncomingSession {
             SessionState::Active(uuid) => uuid,
             SessionState::Ended => return Err(IncomingSessionError::AfterEnd),
         };
-        if rate != SampleRate::Khz8 {
+        if !self.profile.accepts(rate) {
             return self.reject(IncomingSessionError::UnsupportedRate(rate));
         }
-        Ok(IncomingEvent::Audio { uuid, payload })
+        Ok(IncomingEvent::Audio {
+            uuid,
+            rate,
+            payload,
+        })
     }
 
     const fn dtmf<'a>(&mut self, digit: Dtmf) -> Result<IncomingEvent<'a>, IncomingSessionError> {

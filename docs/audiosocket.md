@@ -57,10 +57,12 @@ the remaining destination suffix untouched.
 
 `IncomingSession` applies the selected AP1 incoming policy to already validated
 `TypedMessage` values. Its first UUID establishes the protocol identity, including
-an all-zero UUID. Audio and DTMF before that UUID fail with `MissingUuid`. Exactly
-8 kHz PCM and the ASCII digits `0`–`9`, `*`, `#`, and `A`–`D` are accepted; other
-rates and digits fail. A second UUID and every unknown type also fail. Each policy
-failure ends the session, and every later message or reported EOF returns
+an all-zero UUID. Audio and DTMF before that UUID fail with `MissingUuid`. The
+default profile accepts all nine documented PCM rates and preserves the declared
+rate in each audio event. `IncomingProfile::from_rates` lets a caller select a
+narrower rate set; a rate outside that set and a DTMF byte outside ASCII digits
+`0`–`9`, `*`, `#`, and `A`–`D` fail. A second UUID and every unknown type also
+fail. Each policy failure ends the session, and every later message or reported EOF returns
 `AfterEnd`.
 
 Terminate, peer error, and clean end of input end a session without a policy

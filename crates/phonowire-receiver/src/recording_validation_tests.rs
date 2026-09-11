@@ -239,15 +239,15 @@ fn audio_requires_an_established_uuid_even_with_valid_samples() {
 #[test]
 fn riff_sizes_refuse_the_first_unrepresentable_even_pcm_length() {
     const MAX_EVEN_PCM: u64 = 0xffff_ffda;
-    let header = wave_header(MAX_EVEN_PCM).expect("largest even PCM fits RIFF");
+    let header = wave_header(MAX_EVEN_PCM, SampleRate::Khz8).expect("largest even PCM fits RIFF");
     assert_eq!(&header[4..8], &[0xfe, 0xff, 0xff, 0xff]);
     assert_eq!(&header[40..44], &[0xda, 0xff, 0xff, 0xff]);
     assert_eq!(
-        wave_header(MAX_EVEN_PCM + 2),
+        wave_header(MAX_EVEN_PCM + 2, SampleRate::Khz8),
         Err(RecordingViolation::WaveSize)
     );
     assert_eq!(
-        wave_header(u64::from(u32::MAX) + 1),
+        wave_header(u64::from(u32::MAX) + 1, SampleRate::Khz8),
         Err(RecordingViolation::WaveSize)
     );
 }

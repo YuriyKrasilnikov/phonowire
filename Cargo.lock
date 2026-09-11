@@ -49,6 +49,7 @@ version = "0.1.0"
 name = "phonowire-capture"
 version = "0.1.0"
 dependencies = [
+ "phonowire-audiosocket",
  "phonowire-receiver",
  "serde_json",
  "signal-hook",

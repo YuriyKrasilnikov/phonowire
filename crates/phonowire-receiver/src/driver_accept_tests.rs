@@ -49,6 +49,7 @@ fn fixture(turns: usize) -> (Worker, Records, StopHandle) {
         budget: receiver.budget,
         sender: receiver.sender,
         instance: receiver.instance,
+        profile: receiver.profile,
         live: BTreeMap::new(),
         next: FIRST_CONNECTION,
         listener_ready: true,

@@ -107,7 +107,7 @@ fn main() -> Result<(), ExampleError> {
 fn verify_event(event: IncomingEvent<'_>, event_index: usize) -> Result<(), ExampleError> {
     match (event_index, event) {
         (0, IncomingEvent::Started(uuid)) if uuid.bytes() == UUID => Ok(()),
-        (1, IncomingEvent::Audio { uuid, payload })
+        (1, IncomingEvent::Audio { uuid, payload, .. })
             if uuid.bytes() == UUID && payload.bytes() == [0x00, 0x80, 0xff, 0x7f] =>
         {
             Ok(())

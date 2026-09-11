@@ -5,9 +5,11 @@ handles nonblocking TCP connections and sends owned observations to a consumer.
 The portable `phonowire-audiosocket` codec supplies framing and incoming session
 policy; Mio supplies readiness notifications.
 
-The incoming profile accepts one UUID before mono PCM16LE at 8 kHz or supported
-DTMF. This describes the receiver's policy. Compatibility with a particular peer
-also depends on its version, operating mode and codec configuration.
+`Receiver::bind` accepts one UUID before mono PCM16LE at any of the nine
+documented wire rates or supported DTMF. `Receiver::bind_with_profile` lets a
+caller select a narrower accepted rate set. This describes the receiver's
+policy. Compatibility with a particular peer also depends on its version,
+operating mode and codec configuration.
 Laboratory calls from Asterisk 23.2.0's AudioSocket application on answered
 Local/n channels preserved two independent incoming 8 kHz streams, including
 controlled fragmentation and natural TCP EOF. This result does not cover a
@@ -67,7 +69,8 @@ records remain available after the worker stops.
 
 ## Application lifecycle
 
-1. Create validated `Limits` and a shared `ByteBudget`, then call `Receiver::bind`.
+1. Create validated `Limits` and a shared `ByteBudget`, then call `Receiver::bind`,
+   or `Receiver::bind_with_profile` for an explicit rate restriction.
 2. Move the receiver to a caller-owned worker thread and run `Receiver::run`.
    Consume `Records` concurrently so a full queue can make progress.
 3. Route records by `ConnectionId`. Give each connection its own `Recording`
@@ -109,9 +112,13 @@ completion-based I/O require their own adapters and lifecycle contracts.
 
 ## Recording a connection
 
-`Recording::new` accepts one connection identity and three caller-owned writers:
-exact observed wire bytes, mono 8 kHz PCM16LE WAVE, and diagnostic text. Supply
-empty outputs positioned at zero. The WAVE writer also implements `Seek` so
+`Recording::new` is the explicit 8 kHz compatibility constructor. Use
+`Recording::with_sample_rate` to select the declared source rate for its mono
+PCM16LE WAVE output. Each accepted audio record must carry that exact rate; a
+mismatched rate is refused before its PCM bytes are appended. Both constructors
+accept one connection identity and three caller-owned writers: exact observed
+wire bytes, WAVE audio, and diagnostic text. Supply empty outputs positioned at
+zero. The WAVE writer also implements `Seek` so
 `finish` can replace its provisional sizes. Feed records in their delivered
 order with `record(&record)`, then drop each owned record to return byte credit.
 The adapter never holds a record or writes from the network worker.

@@ -17,7 +17,9 @@ observations, explicit resource credits and caller-controlled shutdown.
 - Incoming sessions preserve UUID identity and separate terminal causes.
 
 The [protocol contract](docs/audiosocket.md) separates general wire values from
-the incoming 8 kHz session policy. Laboratory calls from Asterisk 23.2.0
+incoming session policy. `IncomingSession` and `Receiver::bind` accept all nine
+documented PCM rates by default; callers can use `IncomingProfile` to select a
+narrower accepted set. Laboratory calls from Asterisk 23.2.0
 confirmed exact incoming PCM and separate connection identities for two
 simultaneous streams, including controlled fragmentation and natural TCP EOF.
 The contract describes the tested profile and its compatibility limits.
@@ -87,15 +89,20 @@ charged across worker restarts. These resource bounds do not establish a
 measured call capacity or a latency guarantee.
 
 `Recording` consumes one connection's records into exact wire bytes, accepted
-PCM WAVE audio and diagnostic text. Finalization preserves terminal meaning;
-writer failures report their stage and confirmed output prefixes.
+PCM WAVE audio and diagnostic text. `Recording::with_sample_rate` writes a WAVE
+header for its selected rate and rejects a different audio rate before appending
+PCM; `Recording::new` is the explicit 8 kHz compatibility constructor.
+Finalization preserves terminal meaning; writer failures report their stage and
+confirmed output prefixes.
 The [recording example](crates/phonowire-receiver/examples/record_incoming.rs)
 executes a literal localhost call through both components.
 
 ## Capture application
 
-The maintained `phonowire-capture` CLI receives generic incoming AudioSocket
-connections into bounded create-new output directories. Run it from source with
+The maintained `phonowire-capture` CLI receives 8 kHz-profile incoming
+AudioSocket connections into bounded create-new output directories. This keeps
+its existing per-connection WAVE contract explicit while per-recording rate
+selection remains a separate application capability. Run it from source with
 `cargo run -p phonowire-capture -- --output ./captures`; see the
 [capture contract](docs/capture.md) for limits and shutdown behavior.
 

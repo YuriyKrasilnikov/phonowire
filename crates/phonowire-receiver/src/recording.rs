@@ -10,7 +10,6 @@ const HEADER_BYTES: usize = 44;
 const RIFF_OVERHEAD: u32 = 36;
 const PCM_FORMAT: u16 = 1;
 const CHANNELS: u16 = 1;
-const SAMPLE_RATE: u32 = 8000;
 const SAMPLE_BYTES: u16 = 2;
 const SAMPLE_BITS: u16 = 16;
 const FORMAT_BYTES: u32 = 16;
@@ -127,7 +126,8 @@ pub enum RecordingViolation {
     Uuid,
     /// Wire or protocol offsets disagree with the preserved prefix.
     Offset,
-    /// PCM is not even-length, mono 8 kHz PCM16LE.
+    /// PCM is not even-length mono PCM16LE or does not match the recorder's
+    /// selected sample rate.
     AudioFormat,
     /// PCM would exceed the RIFF WAVE length domain.
     WaveSize,
@@ -206,6 +206,7 @@ enum State {
 /// control of their lifetimes.
 pub struct Recording<Wire: Write, Wave: Write + Seek, Events: Write> {
     id: ConnectionId,
+    sample_rate: SampleRate,
     wire: Wire,
     wave: Wave,
     events: Events,
@@ -215,7 +216,8 @@ pub struct Recording<Wire: Write, Wave: Write + Seek, Events: Write> {
 }
 
 impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Events> {
-    /// Creates a recorder and writes a provisional empty WAVE header.
+    /// Creates an explicit 8 kHz compatibility recorder and writes a provisional
+    /// empty WAVE header.
     ///
     /// # Errors
     /// Returns the header writer's failure, including its accepted prefix.
@@ -225,8 +227,27 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
         wave: Wave,
         events: Events,
     ) -> Result<Self, RecordingError> {
+        Self::with_sample_rate(id, SampleRate::Khz8, wire, wave, events)
+    }
+
+    /// Creates a recorder whose WAVE header declares the selected wire rate.
+    ///
+    /// Every accepted audio record must carry this exact rate. This prevents a
+    /// recording from labelling PCM with a different sample-rate header.
+    ///
+    /// # Errors
+    ///
+    /// Returns the initial WAVE-header write failure.
+    pub fn with_sample_rate(
+        id: ConnectionId,
+        sample_rate: SampleRate,
+        wire: Wire,
+        wave: Wave,
+        events: Events,
+    ) -> Result<Self, RecordingError> {
         let mut recording = Self {
             id,
+            sample_rate,
             wire,
             wave,
             events,
@@ -234,7 +255,8 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
             last_event_offset: 0,
             summary: RecordingSummary::default(),
         };
-        let header = wave_header(0).map_err(|violation| recording.invalid(violation))?;
+        let header =
+            wave_header(0, sample_rate).map_err(|violation| recording.invalid(violation))?;
         let result = write_count(
             &mut recording.wave,
             &header,
@@ -247,9 +269,10 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
     /// Preserves a validated record and appends its diagnostic metadata.
     ///
     /// # Errors
-    /// Rejects wrong identity, ordering, offset or PCM format before that record
-    /// writes output. An I/O failure preserves exact accepted prefixes and makes
-    /// subsequent calls fail without touching writers.
+    /// Rejects wrong identity, ordering, offset, PCM format, or a rate that does
+    /// not match this recorder's WAVE header before that record writes output.
+    /// An I/O failure preserves exact accepted prefixes and makes subsequent
+    /// calls fail without touching writers.
     pub fn record(&mut self, record: &Record) -> Result<(), RecordingError> {
         let next = self
             .validate(record)
@@ -313,8 +336,8 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
         if matches!(self.state, State::Failed) {
             return Err(self.invalid(RecordingViolation::AfterFailure));
         }
-        let header =
-            wave_header(self.summary.audio_bytes).map_err(|violation| self.invalid(violation))?;
+        let header = wave_header(self.summary.audio_bytes, self.sample_rate)
+            .map_err(|violation| self.invalid(violation))?;
         let result = self.wave.seek(SeekFrom::Start(0)).map(|_| ());
         self.output_result(RecordingStage::Seek, result)?;
         let result = write_count(&mut self.wave, &header, &mut self.summary.patch_bytes);
@@ -376,7 +399,7 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
                 if uuid != Some(*identity) {
                     return Err(RecordingViolation::Uuid);
                 }
-                if *rate != SampleRate::Khz8
+                if *rate != self.sample_rate
                     || bytes.as_slice().len() % usize::from(SAMPLE_BYTES) != 0
                 {
                     return Err(RecordingViolation::AudioFormat);
@@ -388,7 +411,7 @@ impl<Wire: Write, Wave: Write + Seek, Events: Write> Recording<Wire, Wave, Event
                     .audio_bytes
                     .checked_add(count)
                     .ok_or(RecordingViolation::WaveSize)?;
-                wave_header(next)?;
+                wave_header(next, self.sample_rate)?;
                 Ok(self.state)
             }
             RecordKind::Dtmf { uuid: identity, .. } => {
@@ -463,7 +486,10 @@ fn write_count<Output: Write>(
     Ok(())
 }
 
-fn wave_header(audio_bytes: u64) -> Result<[u8; HEADER_BYTES], RecordingViolation> {
+fn wave_header(
+    audio_bytes: u64,
+    sample_rate: SampleRate,
+) -> Result<[u8; HEADER_BYTES], RecordingViolation> {
     let data = u32::try_from(audio_bytes).map_err(|_| RecordingViolation::WaveSize)?;
     let riff = data
         .checked_add(RIFF_OVERHEAD)
@@ -476,8 +502,9 @@ fn wave_header(audio_bytes: u64) -> Result<[u8; HEADER_BYTES], RecordingViolatio
     header[16..20].copy_from_slice(&FORMAT_BYTES.to_le_bytes());
     header[20..22].copy_from_slice(&PCM_FORMAT.to_le_bytes());
     header[22..24].copy_from_slice(&CHANNELS.to_le_bytes());
-    header[24..28].copy_from_slice(&SAMPLE_RATE.to_le_bytes());
-    header[28..32].copy_from_slice(&(SAMPLE_RATE * u32::from(SAMPLE_BYTES)).to_le_bytes());
+    let hertz = sample_rate.hertz();
+    header[24..28].copy_from_slice(&hertz.to_le_bytes());
+    header[28..32].copy_from_slice(&(hertz * u32::from(SAMPLE_BYTES)).to_le_bytes());
     header[32..34].copy_from_slice(&SAMPLE_BYTES.to_le_bytes());
     header[34..36].copy_from_slice(&SAMPLE_BITS.to_le_bytes());
     header[36..40].copy_from_slice(b"data");

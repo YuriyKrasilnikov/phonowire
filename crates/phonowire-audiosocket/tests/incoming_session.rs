@@ -1,7 +1,7 @@
 //! Black-box AP1 incoming-session behavior witnesses.
 use phonowire_audiosocket::{
-    IncomingEvent, IncomingSession, IncomingSessionError, RawEnvelope, SampleRate, SessionEnd,
-    TypedMessage, Uuid, WireType,
+    IncomingEvent, IncomingProfile, IncomingSession, IncomingSessionError, RawEnvelope, SampleRate,
+    SessionEnd, TypedMessage, Uuid, WireType,
 };
 
 const UUID_ONE: [u8; 16] = [1; 16];
@@ -98,14 +98,15 @@ fn media_before_uuid_has_priority_over_rate_and_digit_policy() {
 }
 
 #[test]
-fn media_after_uuid_accepts_only_8khz_and_preserves_empty_payload() {
+fn explicit_8khz_profile_accepts_only_8khz_and_preserves_empty_payload() {
     let payload = [0, 128, 255, 127];
-    let mut accepted = IncomingSession::new();
+    let mut accepted = IncomingSession::with_profile(IncomingProfile::PCM_8_KHZ);
     started(&mut accepted, UUID_ONE);
     match accepted.receive(typed(0x10, &payload)) {
         Ok(IncomingEvent::Audio {
             uuid,
             payload: observed,
+            ..
         }) => {
             assert_eq!(uuid, Uuid::new(UUID_ONE));
             assert_eq!(observed.bytes(), payload);
@@ -127,7 +128,7 @@ fn media_after_uuid_accepts_only_8khz_and_preserves_empty_payload() {
         (0x17, SampleRate::Khz96),
         (0x18, SampleRate::Khz192),
     ] {
-        let mut session = IncomingSession::new();
+        let mut session = IncomingSession::with_profile(IncomingProfile::PCM_8_KHZ);
         started(&mut session, UUID_ONE);
         assert_eq!(
             session.receive(typed(tag, &[])),
@@ -234,5 +235,48 @@ fn end_reasons_are_distinct_before_and_after_uuid_and_absorb_later_input() {
             }),
         );
         assert_after_end(&mut end_of_input);
+    }
+}
+
+#[test]
+fn explicit_profile_preserves_the_declared_16khz_rate() {
+    let mut session =
+        IncomingSession::with_profile(IncomingProfile::from_rates(&[SampleRate::Khz16]));
+    started(&mut session, UUID_ONE);
+    match session.receive(typed(0x12, &[0, 0])) {
+        Ok(IncomingEvent::Audio {
+            uuid,
+            rate,
+            payload,
+        }) => {
+            assert_eq!(uuid, Uuid::new(UUID_ONE));
+            assert_eq!(rate, SampleRate::Khz16);
+            assert_eq!(payload.bytes(), [0, 0]);
+        }
+        other => panic!("16 kHz profile result: {other:?}"),
+    }
+}
+
+#[test]
+fn default_profile_preserves_every_documented_wire_rate() {
+    let rates = [
+        (0x10, SampleRate::Khz8),
+        (0x11, SampleRate::Khz12),
+        (0x12, SampleRate::Khz16),
+        (0x13, SampleRate::Khz24),
+        (0x14, SampleRate::Khz32),
+        (0x15, SampleRate::Khz44_1),
+        (0x16, SampleRate::Khz48),
+        (0x17, SampleRate::Khz96),
+        (0x18, SampleRate::Khz192),
+    ];
+    for (wire_type, rate) in rates {
+        let mut session = IncomingSession::new();
+        started(&mut session, UUID_ONE);
+        assert!(matches!(
+            session.receive(typed(wire_type, &[0, 0])),
+            Ok(IncomingEvent::Audio { rate: actual, payload, .. })
+                if actual == rate && payload.bytes() == [0, 0]
+        ));
     }
 }
