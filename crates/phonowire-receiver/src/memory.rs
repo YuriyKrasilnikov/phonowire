@@ -1,8 +1,11 @@
 //! Shared accounting for output bytes retained by receiver records.
+use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
+
+use crate::ConnectionId;
 
 /// A refusal to retain more output bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +68,61 @@ struct BudgetState {
     subscriber: Option<Waker>,
 }
 
+/// Per-connection retained payload accounting for one receiver.
+///
+/// Entries exist only while owned payload bytes remain, so completed identities
+/// are not retained as an unbounded history.
+#[derive(Clone, Debug, Default)]
+pub struct RetentionTracker {
+    state: Arc<Mutex<BTreeMap<ConnectionId, usize>>>,
+}
+
+impl RetentionTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn add(&self, id: ConnectionId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("retention tracker mutex cannot be poisoned");
+        let current = state.entry(id).or_default();
+        *current = current
+            .checked_add(bytes)
+            .expect("retained payload counter overflow");
+        drop(state);
+    }
+    pub(crate) fn release(&self, id: ConnectionId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("retention tracker mutex cannot be poisoned");
+        let current = state.get_mut(&id).expect("retained payload entry exists");
+        *current = current
+            .checked_sub(bytes)
+            .expect("retained payload release exceeds charge");
+        if *current == 0 {
+            state.remove(&id);
+        }
+        drop(state);
+    }
+    pub(crate) fn used(&self, id: ConnectionId) -> usize {
+        *self
+            .state
+            .lock()
+            .expect("retention tracker mutex cannot be poisoned")
+            .get(&id)
+            .unwrap_or(&0)
+    }
+}
+
 /// Owned bytes charged to a [`ByteBudget`] until their backing storage drops.
 #[derive(Debug)]
 pub struct OwnedBytes {
@@ -77,6 +135,7 @@ pub struct OwnedBytes {
 struct Charge {
     budget: ByteBudget,
     bytes: usize,
+    retention: Option<(RetentionTracker, ConnectionId)>,
 }
 
 /// A worker's exclusive byte-credit notification registration.
@@ -123,6 +182,27 @@ impl ByteBudget {
     /// Returns [`BudgetError::TooLarge`] when one request exceeds the entire
     /// account and [`BudgetError::Full`] when live output consumes the remainder.
     pub fn try_copy(&self, bytes: &[u8]) -> Result<OwnedBytes, BudgetError> {
+        self.try_copy_tracked(bytes, None)
+    }
+
+    pub(crate) fn retention_tracker() -> RetentionTracker {
+        RetentionTracker::new()
+    }
+
+    pub(crate) fn try_copy_for(
+        &self,
+        id: ConnectionId,
+        tracker: &RetentionTracker,
+        bytes: &[u8],
+    ) -> Result<OwnedBytes, BudgetError> {
+        self.try_copy_tracked(bytes, Some((tracker.clone(), id)))
+    }
+
+    fn try_copy_tracked(
+        &self,
+        bytes: &[u8],
+        retention: Option<(RetentionTracker, ConnectionId)>,
+    ) -> Result<OwnedBytes, BudgetError> {
         let required = bytes.len();
         if required > self.capacity() {
             return Err(BudgetError::TooLarge {
@@ -130,7 +210,10 @@ impl ByteBudget {
                 capacity: self.capacity(),
             });
         }
-        let charge = self.reserve(required)?;
+        let charge = self.reserve(required, retention)?;
+        if let Some((tracker, id)) = &charge.retention {
+            tracker.add(*id, required);
+        }
         let storage: Box<[u8]> = Box::from(bytes);
         Ok(OwnedBytes {
             bytes: storage,
@@ -138,7 +221,11 @@ impl ByteBudget {
         })
     }
 
-    fn reserve(&self, required: usize) -> Result<Charge, BudgetError> {
+    fn reserve(
+        &self,
+        required: usize,
+        retention: Option<(RetentionTracker, ConnectionId)>,
+    ) -> Result<Charge, BudgetError> {
         let mut state = self.locked();
         let available = self.capacity() - state.used;
         if required > available {
@@ -152,6 +239,7 @@ impl ByteBudget {
         Ok(Charge {
             budget: self.clone(),
             bytes: required,
+            retention,
         })
     }
 
@@ -208,6 +296,9 @@ impl OwnedBytes {
 
 impl Drop for Charge {
     fn drop(&mut self) {
+        if let Some((tracker, id)) = &self.retention {
+            tracker.release(*id, self.bytes);
+        }
         self.budget.release(self.bytes);
     }
 }

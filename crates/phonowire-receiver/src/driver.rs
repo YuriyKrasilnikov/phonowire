@@ -5,8 +5,8 @@ use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll as TaskPoll, Waker};
 use std::time::{Duration, Instant};
 
@@ -74,6 +74,8 @@ pub struct RunSummary {
     pub ended: usize,
     /// Connections destroyed without handing off a terminal record.
     pub abandoned: usize,
+    /// Connections physically retired by a scoped close request.
+    pub closed_by_request: usize,
     /// Connections still active at the shutdown boundary.
     pub live: usize,
     /// Bytes observed by successful TCP reads.
@@ -106,6 +108,7 @@ impl Default for RunSummary {
             refused: 0,
             ended: 0,
             abandoned: 0,
+            closed_by_request: 0,
             live: 0,
             raw_bytes_read: 0,
             raw_bytes_handed_off: 0,
@@ -184,6 +187,193 @@ impl std::error::Error for ReceiverError {
     }
 }
 
+/// The physical result of a scoped connection-close request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionCloseResult {
+    /// The worker retired the exact connection at the request boundary.
+    RetiredByRequest,
+    /// The connection ended before the worker processed the request.
+    ConnectionEnded,
+    /// Whole-receiver shutdown retired the connection before the request completed.
+    ReceiverStopped,
+}
+
+/// A request cannot name a current connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionCloseError {
+    /// The opaque identity belongs to another receiver or is no longer live.
+    UnknownOrStale,
+    /// The receiver is stopping and cannot accept a scoped request.
+    ReceiverStopping,
+}
+
+/// Completion observer for one coalesced scoped-close request.
+#[derive(Clone)]
+pub struct CloseTicket {
+    id: ConnectionId,
+    state: Arc<CloseState>,
+}
+
+impl CloseTicket {
+    /// Returns the exact requested connection identity.
+    #[must_use]
+    pub const fn connection(&self) -> ConnectionId {
+        self.id
+    }
+
+    /// Returns the completion result if worker retirement has finished.
+    #[must_use]
+    pub fn try_result(&self) -> Option<ConnectionCloseResult> {
+        *close_lock(&self.state.result)
+    }
+
+    /// Returns payload bytes from this connection still owned by output records.
+    #[must_use]
+    pub fn retained_output_bytes(&self) -> usize {
+        self.state.retention.used(self.id)
+    }
+
+    /// Waits at most `timeout` for physical retirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another thread poisoned this ticket's completion mutex.
+    #[must_use]
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<ConnectionCloseResult> {
+        let result = close_lock(&self.state.result);
+        let (result, _) = self
+            .state
+            .done
+            .wait_timeout_while(result, timeout, |value| value.is_none())
+            .expect("close ticket condition cannot be poisoned");
+        *result
+    }
+}
+
+struct CloseState {
+    result: Mutex<Option<ConnectionCloseResult>>,
+    done: Condvar,
+    retention: crate::RetentionTracker,
+}
+
+struct ControlEntry {
+    requested: bool,
+    state: Arc<CloseState>,
+}
+
+struct ControlState {
+    stopping: bool,
+    entries: BTreeMap<ConnectionId, ControlEntry>,
+}
+
+struct ConnectionControls {
+    instance: u64,
+    signals: Arc<Signals>,
+    retention: crate::RetentionTracker,
+    state: Mutex<ControlState>,
+}
+
+/// Cloneable scoped-connection control for one bound receiver.
+#[derive(Clone)]
+pub struct ConnectionControlHandle {
+    controls: Arc<ConnectionControls>,
+}
+
+impl ConnectionControlHandle {
+    /// Requests physical retirement of one currently admitted connection.
+    ///
+    /// Calls for a foreign, stale, or naturally completed identity do not alter
+    /// another connection and allocate no retained control state. Repeated calls
+    /// before retirement return observers for the same completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownOrStale` for a foreign or no-longer-live identity and
+    /// `ReceiverStopping` once whole-receiver shutdown has begun.
+    pub fn close(&self, id: ConnectionId) -> Result<CloseTicket, ConnectionCloseError> {
+        if id.instance() != self.controls.instance {
+            return Err(ConnectionCloseError::UnknownOrStale);
+        }
+        let ticket = {
+            let mut state = close_lock(&self.controls.state);
+            if state.stopping {
+                return Err(ConnectionCloseError::ReceiverStopping);
+            }
+            let Some(entry) = state.entries.get_mut(&id) else {
+                return Err(ConnectionCloseError::UnknownOrStale);
+            };
+            entry.requested = true;
+            let ticket = CloseTicket {
+                id,
+                state: Arc::clone(&entry.state),
+            };
+            drop(state);
+            ticket
+        };
+        self.controls.signals.publish(Signal::Control);
+        Ok(ticket)
+    }
+}
+
+impl ConnectionControls {
+    fn new(instance: u64, signals: Arc<Signals>, retention: crate::RetentionTracker) -> Arc<Self> {
+        Arc::new(Self {
+            instance,
+            signals,
+            retention,
+            state: Mutex::new(ControlState {
+                stopping: false,
+                entries: BTreeMap::new(),
+            }),
+        })
+    }
+    fn register(&self, id: ConnectionId) {
+        let state = Arc::new(CloseState {
+            result: Mutex::new(None),
+            done: Condvar::new(),
+            retention: self.retention.clone(),
+        });
+        let previous = close_lock(&self.state).entries.insert(
+            id,
+            ControlEntry {
+                requested: false,
+                state,
+            },
+        );
+        assert!(previous.is_none(), "connection identity is fresh");
+    }
+    fn requested(&self, id: ConnectionId) -> bool {
+        close_lock(&self.state)
+            .entries
+            .get(&id)
+            .is_some_and(|entry| entry.requested)
+    }
+    fn finish(&self, id: ConnectionId, result: ConnectionCloseResult) {
+        let entry = close_lock(&self.state).entries.remove(&id);
+        if let Some(entry) = entry {
+            *close_lock(&entry.state.result) = Some(result);
+            entry.state.done.notify_all();
+        }
+    }
+    fn stop_all(&self) {
+        let entries = {
+            let mut state = close_lock(&self.state);
+            state.stopping = true;
+            std::mem::take(&mut state.entries)
+        };
+        for (_, entry) in entries {
+            *close_lock(&entry.state.result) = Some(ConnectionCloseResult::ReceiverStopped);
+            entry.state.done.notify_all();
+        }
+    }
+}
+
+fn close_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .expect("connection control mutex cannot be poisoned")
+}
+
 /// Independent cancellation control for one receiver.
 ///
 /// Dropping the handle requests stop. Queue capacity cannot prevent that request.
@@ -223,6 +413,7 @@ pub struct Receiver {
     sender: RecordSender,
     instance: u64,
     profile: IncomingProfile,
+    controls: Arc<ConnectionControls>,
 }
 
 impl Receiver {
@@ -272,6 +463,11 @@ impl Receiver {
         listener.set_nonblocking(true).map_err(bind_io)?;
         let local = listener.local_addr().map_err(bind_io)?;
         let signals = Signals::new();
+        let controls = ConnectionControls::new(
+            instance,
+            Arc::clone(&signals),
+            ByteBudget::retention_tracker(),
+        );
         let (sender, records) = handoff::channel(
             limits.channel_capacity(),
             signals.waker(Signal::Queue),
@@ -287,10 +483,19 @@ impl Receiver {
                 sender,
                 instance,
                 profile,
+                controls,
             },
             records,
             StopHandle { signals },
         ))
+    }
+
+    /// Returns cloneable scoped control for connections admitted by this receiver.
+    #[must_use]
+    pub fn connection_control(&self) -> ConnectionControlHandle {
+        ConnectionControlHandle {
+            controls: Arc::clone(&self.controls),
+        }
     }
 
     /// Returns the bound listener address.
@@ -342,6 +547,7 @@ impl Receiver {
             sender: self.sender,
             instance: self.instance,
             profile: self.profile,
+            controls: self.controls,
             live: BTreeMap::new(),
             next: FIRST_CONNECTION,
             listener_ready: true,
@@ -356,7 +562,8 @@ impl Receiver {
             worker.summary.counters_complete = false;
         }
         worker.summary.live = worker.live.len();
-        let cleanup = worker.retire_all();
+        let cleanup = worker.retire_all(ConnectionCloseResult::ReceiverStopped);
+        worker.controls.stop_all();
         worker.summary.retained_output_bytes = worker.budget.used();
         match result.and_then(|cause| cleanup.map(|()| cause)) {
             Ok(cause) => {
@@ -478,6 +685,7 @@ struct Worker {
     sender: RecordSender,
     instance: u64,
     profile: IncomingProfile,
+    controls: Arc<ConnectionControls>,
     live: BTreeMap<Token, Entry>,
     next: usize,
     listener_ready: bool,
@@ -504,6 +712,10 @@ impl Worker {
             if let Some(cause) = self.stop_cause() {
                 return Ok(cause);
             }
+            self.retire_requested()?;
+            if self.signals.take_control() {
+                self.retire_requested()?;
+            }
             if self.signals.take_queue_credit() {
                 self.scheduler.resume_credit(WaitReason::Queue);
             }
@@ -511,6 +723,7 @@ impl Worker {
                 self.scheduler.resume_credit(WaitReason::Bytes);
             }
             self.run_ready()?;
+            self.retire_requested()?;
             if let Some(cause) = self.stop_cause() {
                 return Ok(cause);
             }
@@ -645,12 +858,14 @@ impl Worker {
         accept
             .register(self.poll.registry(), &mut socket, token)
             .map_err(ReceiverFailure::Io)?;
+        let id = ConnectionId::new(self.instance, token.0);
         let context = TaskContext::new(
-            ConnectionId::new(self.instance, token.0),
+            id,
             peer,
             token,
             TaskResources {
                 budget: self.budget.clone(),
+                retention: self.controls.retention.clone(),
                 sender: self.sender.clone(),
                 scheduler: self.scheduler.clone(),
             },
@@ -675,6 +890,7 @@ impl Worker {
                 .is_none(),
             "connection token is fresh"
         );
+        self.controls.register(id);
         self.summary.accepted = self
             .summary
             .accepted
@@ -684,17 +900,50 @@ impl Worker {
     }
 
     fn retire(&mut self, token: Token) -> Result<(), ReceiverFailure> {
+        self.retire_with(token, ConnectionCloseResult::ConnectionEnded)
+    }
+
+    fn retire_with(
+        &mut self,
+        token: Token,
+        close_result: ConnectionCloseResult,
+    ) -> Result<(), ReceiverFailure> {
         self.scheduler.retire(token);
         let entry = self.live.remove(&token).expect("retiring task is live");
+        let id = entry.context.id();
         let progress = entry.context.progress();
         drop(entry);
+        self.controls.finish(id, close_result);
+        if close_result == ConnectionCloseResult::RetiredByRequest {
+            self.summary.closed_by_request = self
+                .summary
+                .closed_by_request
+                .checked_add(1)
+                .ok_or(ReceiverFailure::CounterExhausted)?;
+        }
         self.absorb(progress)
     }
 
-    fn retire_all(&mut self) -> Result<(), ReceiverFailure> {
+    fn retire_requested(&mut self) -> Result<(), ReceiverFailure> {
+        let tokens = self
+            .live
+            .iter()
+            .filter_map(|(token, entry)| {
+                self.controls
+                    .requested(entry.context.id())
+                    .then_some(*token)
+            })
+            .collect::<Vec<_>>();
+        for token in tokens {
+            self.retire_with(token, ConnectionCloseResult::RetiredByRequest)?;
+        }
+        Ok(())
+    }
+
+    fn retire_all(&mut self, close_result: ConnectionCloseResult) -> Result<(), ReceiverFailure> {
         let mut failure = None;
         while let Some(token) = self.live.keys().next().copied() {
-            if let Err(error) = self.retire(token) {
+            if let Err(error) = self.retire_with(token, close_result) {
                 failure = Some(error);
             }
         }
@@ -760,6 +1009,50 @@ fn merge_progress(summary: &mut RunSummary, progress: Progress) -> Result<(), Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_close_ticket_is_completed_by_whole_receiver_shutdown() {
+        let signals = Signals::new();
+        let controls = ConnectionControls::new(7, signals, ByteBudget::retention_tracker());
+        let id = ConnectionId::new(7, 3);
+        controls.register(id);
+        let handle = ConnectionControlHandle {
+            controls: Arc::clone(&controls),
+        };
+        let ticket = handle.close(id).expect("live id accepts close");
+        let duplicate = handle.close(id).expect("live request coalesces");
+        assert_eq!(ticket.connection(), duplicate.connection());
+        controls.stop_all();
+        assert_eq!(
+            ticket.wait_timeout(Duration::ZERO),
+            Some(ConnectionCloseResult::ReceiverStopped)
+        );
+        assert_eq!(
+            duplicate.wait_timeout(Duration::ZERO),
+            Some(ConnectionCloseResult::ReceiverStopped)
+        );
+    }
+
+    #[test]
+    fn control_registry_releases_each_finished_identity_during_bounded_churn() {
+        let signals = Signals::new();
+        let controls = ConnectionControls::new(8, signals, ByteBudget::retention_tracker());
+        for sequence in 0..128 {
+            let id = ConnectionId::new(8, sequence);
+            controls.register(id);
+            let ticket = ConnectionControlHandle {
+                controls: Arc::clone(&controls),
+            }
+            .close(id)
+            .expect("current id accepts close");
+            controls.finish(id, ConnectionCloseResult::RetiredByRequest);
+            assert_eq!(
+                ticket.try_result(),
+                Some(ConnectionCloseResult::RetiredByRequest)
+            );
+            assert!(close_lock(&controls.state).entries.is_empty());
+        }
+    }
 
     #[test]
     fn exhausted_tokens_never_wrap_or_change_the_counter() {

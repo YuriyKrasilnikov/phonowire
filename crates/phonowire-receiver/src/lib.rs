@@ -14,8 +14,12 @@ mod recording;
 mod scheduler;
 
 pub use config::{Limits, LimitsError, READ_BYTES};
-pub use driver::{Receiver, ReceiverError, ReceiverFailure, RunSummary, StopCause, StopHandle};
+pub use driver::{
+    CloseTicket, ConnectionCloseError, ConnectionCloseResult, ConnectionControlHandle, Receiver,
+    ReceiverError, ReceiverFailure, RunSummary, StopCause, StopHandle,
+};
 pub use handoff::Records;
+pub(crate) use memory::RetentionTracker;
 pub use memory::{BudgetError, ByteBudget, OwnedBytes};
 pub use record::{ConnectionId, EndReason, Record, RecordKind, WireOffset};
 

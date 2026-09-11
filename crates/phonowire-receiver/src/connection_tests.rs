@@ -39,6 +39,7 @@ impl Harness {
             SocketAddr::from(([127, 0, 0, 1], 9)),
             TOKEN,
             TaskResources {
+                retention: ByteBudget::retention_tracker(),
                 budget,
                 sender,
                 scheduler: scheduler.clone(),

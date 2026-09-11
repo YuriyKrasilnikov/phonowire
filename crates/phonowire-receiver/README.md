@@ -67,6 +67,14 @@ into a `std::thread` when reception and consumption need separate threads.
 work; it does not promise that every received byte reached the consumer. Queued
 records remain available after the worker stops.
 
+`Receiver::connection_control` returns a cloneable handle for retiring one
+currently admitted `ConnectionId`. `close` refuses foreign, stale, and naturally
+ended identities without affecting another connection. Concurrent close requests
+for the same live identity return tickets for the same retirement result. A ticket
+completes when the worker has retired that socket task; queued records can still
+retain their payload bytes until the consumer drops them, and
+`retained_output_bytes` reports that remaining per-connection charge.
+
 ## Application lifecycle
 
 1. Create validated `Limits` and a shared `ByteBudget`, then call `Receiver::bind`,

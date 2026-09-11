@@ -56,6 +56,7 @@ impl Harness {
             token,
             TaskResources {
                 budget: self.budget.clone(),
+                retention: ByteBudget::retention_tracker(),
                 sender: self.sender.clone(),
                 scheduler: self.scheduler.clone(),
             },

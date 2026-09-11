@@ -50,6 +50,7 @@ fn fixture(turns: usize) -> (Worker, Records, StopHandle) {
         sender: receiver.sender,
         instance: receiver.instance,
         profile: receiver.profile,
+        controls: receiver.controls,
         live: BTreeMap::new(),
         next: FIRST_CONNECTION,
         listener_ready: true,
@@ -306,7 +307,9 @@ fn pending_backlog_recovers_after_error_and_quota_without_another_edge() {
         .accept_ready(&mut source)
         .expect("no edge, no attempt after drain");
     assert_eq!(source.attempts, 5);
-    worker.retire_all().expect("close admitted peers");
+    worker
+        .retire_all(ConnectionCloseResult::ReceiverStopped)
+        .expect("close admitted peers");
 }
 
 #[test]

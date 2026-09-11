@@ -9,8 +9,10 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use mio::{Token, Waker as MioWaker};
 
-use crate::handoff::RecordSender;
-use crate::{BudgetError, ByteBudget, ConnectionId, OwnedBytes, Record, RecordKind};
+use crate::handoff::{RecordSender, SendFailure as HandoffSendFailure};
+use crate::{
+    BudgetError, ByteBudget, ConnectionId, OwnedBytes, Record, RecordKind, RetentionTracker,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitReason {
@@ -25,6 +27,7 @@ pub enum Signal {
     Bytes,
     Stop,
     Disconnected,
+    Control,
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +41,7 @@ pub struct Signals {
     bytes: AtomicBool,
     stop: AtomicBool,
     disconnected: AtomicBool,
+    control: AtomicBool,
     wake: Mutex<Option<Weak<MioWaker>>>,
     failure: Mutex<Option<WakeFailure>>,
 }
@@ -49,6 +53,7 @@ impl Signals {
             bytes: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
+            control: AtomicBool::new(false),
             wake: Mutex::new(None),
             failure: Mutex::new(None),
         })
@@ -65,6 +70,7 @@ impl Signals {
             Signal::Bytes => &self.bytes,
             Signal::Stop => &self.stop,
             Signal::Disconnected => &self.disconnected,
+            Signal::Control => &self.control,
         };
         flag.store(true, Ordering::Release);
     }
@@ -123,6 +129,10 @@ impl Signals {
 
     pub fn take_byte_credit(&self) -> bool {
         self.bytes.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn take_control(&self) -> bool {
+        self.control.swap(false, Ordering::AcqRel)
     }
 
     pub fn waker(self: &Arc<Self>, signal: Signal) -> Waker {
@@ -487,6 +497,7 @@ pub struct TaskContext {
     peer: SocketAddr,
     token: Token,
     budget: ByteBudget,
+    retention: RetentionTracker,
     sender: RecordSender,
     scheduler: Scheduler,
     remaining: Arc<AtomicUsize>,
@@ -495,6 +506,7 @@ pub struct TaskContext {
 
 pub struct TaskResources {
     pub budget: ByteBudget,
+    pub retention: RetentionTracker,
     pub sender: RecordSender,
     pub scheduler: Scheduler,
 }
@@ -506,6 +518,7 @@ impl TaskContext {
             peer,
             token,
             budget: resources.budget,
+            retention: resources.retention,
             sender: resources.sender,
             scheduler: resources.scheduler,
             remaining: Arc::new(AtomicUsize::new(0)),
@@ -607,7 +620,7 @@ impl TaskContext {
                 self.park(WaitReason::Bytes);
                 return Poll::Pending;
             }
-            match self.budget.try_copy(bytes) {
+            match self.budget.try_copy_for(self.id, &self.retention, bytes) {
                 Ok(owned) => Poll::Ready(Ok(owned)),
                 Err(BudgetError::Full { .. }) => {
                     self.park(WaitReason::Bytes);
@@ -668,12 +681,12 @@ impl TaskContext {
                     drop(progress);
                     Poll::Ready(Ok(()))
                 }
-                Err(std::sync::mpsc::TrySendError::Full(record)) => {
-                    pending = Some(record);
+                Err(HandoffSendFailure::Full(record)) => {
+                    pending = Some(*record);
                     self.park(WaitReason::Queue);
                     Poll::Pending
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_record)) => {
+                Err(HandoffSendFailure::Disconnected(_record)) => {
                     Poll::Ready(Err(SendFailure::Disconnected))
                 }
             }
@@ -717,6 +730,7 @@ mod tests {
             Token(2),
             TaskResources {
                 budget: ByteBudget::new(std::num::NonZeroUsize::MIN),
+                retention: RetentionTracker::default(),
                 sender,
                 scheduler,
             },

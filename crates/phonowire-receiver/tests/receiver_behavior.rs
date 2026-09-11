@@ -5,7 +5,11 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use phonowire_receiver::{ByteBudget, EndReason, Limits, Receiver, RecordKind, Records};
+use phonowire_audiosocket::SampleRate;
+use phonowire_receiver::{
+    ByteBudget, ConnectionCloseError, ConnectionCloseResult, EndReason, Limits, Receiver,
+    RecordKind, Records,
+};
 
 fn limits(slots: usize, turns: usize) -> Limits {
     Limits::new(
@@ -340,4 +344,129 @@ fn stop_cancels_an_accepted_task_without_assuming_its_wait_state() {
         queued += 1;
     }
     assert_eq!(summary.records_handed_off, queued + 1);
+}
+
+#[test]
+fn scoped_close_retires_one_connection_while_output_is_full() {
+    let budget = ByteBudget::new(NonZeroUsize::new(8192).expect("budget"));
+    let (receiver, records, stop) = Receiver::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        limits(3, 1),
+        budget.clone(),
+    )
+    .expect("bind");
+    let local = receiver.local_addr();
+    let control = receiver.connection_control();
+    let worker = thread::spawn(move || receiver.run());
+    let mut peer = TcpStream::connect(local).expect("connect");
+    let connected = next_record(&records, Instant::now() + Duration::from_secs(2));
+    let id = connected.connection;
+    peer.write_all(&[
+        0x01, 0x00, 0x10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 0x00, 0x02, 0, 0,
+    ])
+    .expect("uuid and audio");
+    peer.flush().expect("flush");
+    thread::sleep(Duration::from_millis(50));
+    let ticket = control.close(id).expect("request exact close");
+    let (foreign_receiver, _foreign_records, _foreign_stop) = Receiver::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        limits(3, 1),
+        ByteBudget::new(NonZeroUsize::new(8192).expect("foreign budget")),
+    )
+    .expect("foreign bind");
+    assert!(matches!(
+        foreign_receiver.connection_control().close(id),
+        Err(ConnectionCloseError::UnknownOrStale)
+    ));
+    assert_eq!(
+        ticket.wait_timeout(Duration::from_secs(2)),
+        Some(ConnectionCloseResult::RetiredByRequest)
+    );
+    assert!(
+        matches!(control.close(id), Err(ConnectionCloseError::UnknownOrStale)),
+        "a retired identity cannot affect a later connection"
+    );
+    let first = next_record(&records, Instant::now() + Duration::from_secs(2));
+    let second = next_record(&records, Instant::now() + Duration::from_secs(2));
+    let third = next_record(&records, Instant::now() + Duration::from_secs(2));
+    let audio = [first, second, third]
+        .into_iter()
+        .find(|record| matches!(record.kind, RecordKind::Audio { .. }))
+        .expect("queued audio remains readable after physical retirement");
+    assert_eq!(ticket.retained_output_bytes(), 2);
+    drop(audio);
+    assert_eq!(ticket.retained_output_bytes(), 0);
+    stop.stop().expect("stop");
+    worker.join().expect("worker thread").expect("worker run");
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn scoped_close_of_a_does_not_interrupt_b_afterward() {
+    let budget = ByteBudget::new(NonZeroUsize::new(8192).expect("budget"));
+    let (receiver, records, stop) = Receiver::bind(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        limits(32, 1),
+        budget.clone(),
+    )
+    .expect("bind");
+    let local = receiver.local_addr();
+    let control = receiver.connection_control();
+    let worker = thread::spawn(move || receiver.run());
+    let _a = TcpStream::connect(local).expect("connect A");
+    let a_id = next_record(&records, Instant::now() + Duration::from_secs(2)).connection;
+    let mut b = TcpStream::connect(local).expect("connect B");
+    let b_id = next_record(&records, Instant::now() + Duration::from_secs(2)).connection;
+    assert_ne!(a_id, b_id);
+
+    let ticket = control.close(a_id).expect("close A");
+    assert_eq!(
+        ticket.wait_timeout(Duration::from_secs(2)),
+        Some(ConnectionCloseResult::RetiredByRequest)
+    );
+
+    let b_payload = [0x34, 0x12];
+    b.write_all(&[
+        0x01,
+        0x00,
+        0x10,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1,
+        0x10,
+        0x00,
+        0x02,
+        b_payload[0],
+        b_payload[1],
+    ])
+    .expect("B uuid and audio after A close");
+    b.flush().expect("flush B");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut b_audio = None;
+    while Instant::now() < deadline {
+        let record = next_record(&records, deadline);
+        if record.connection == b_id
+            && let RecordKind::Audio { rate, bytes, .. } = record.kind
+        {
+            b_audio = Some((rate, bytes.as_slice().to_vec()));
+            break;
+        }
+    }
+    assert_eq!(b_audio, Some((SampleRate::Khz8, b_payload.to_vec())));
+    stop.stop().expect("global stop");
+    worker.join().expect("worker thread").expect("worker run");
+    assert_eq!(budget.used(), 0);
 }

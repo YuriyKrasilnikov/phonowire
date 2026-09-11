@@ -6,6 +6,15 @@ use std::time::Duration;
 
 use crate::Record;
 
+/// Internal ownership-preserving result of a non-blocking record handoff.
+#[derive(Debug)]
+pub enum SendFailure {
+    /// The bounded queue is full; the original record remains owned by the caller.
+    Full(Box<Record>),
+    /// The consumer disappeared; the original record remains owned by the caller.
+    Disconnected(Box<Record>),
+}
+
 /// Sender held by the worker for non-blocking record handoff.
 #[derive(Clone, Debug)]
 pub struct RecordSender {
@@ -37,8 +46,14 @@ pub fn channel(
 }
 
 impl RecordSender {
-    pub fn try_send(&self, record: Record) -> Result<(), mpsc::TrySendError<Record>> {
-        self.sender.try_send(record)
+    pub fn try_send(&self, record: Record) -> Result<(), SendFailure> {
+        match self.sender.try_send(record) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(record)) => Err(SendFailure::Full(Box::new(record))),
+            Err(mpsc::TrySendError::Disconnected(record)) => {
+                Err(SendFailure::Disconnected(Box::new(record)))
+            }
+        }
     }
 }
 
@@ -147,7 +162,7 @@ mod tests {
             Err(error) => panic!("first record should fit: {error:?}"),
         }
         match sender.try_send(record(8)) {
-            Err(mpsc::TrySendError::Full(returned)) => assert_eq!(returned.offset.get(), 8),
+            Err(SendFailure::Full(returned)) => assert_eq!(returned.offset.get(), 8),
             Err(error) => panic!("second record should be full: {error:?}"),
             Ok(()) => panic!("second record unexpectedly fit"),
         }
@@ -171,7 +186,7 @@ mod tests {
         drop(records);
         assert_eq!(disconnected_counter.0.load(Ordering::SeqCst), 1);
         match sender.try_send(record(1)) {
-            Err(mpsc::TrySendError::Disconnected(returned)) => {
+            Err(SendFailure::Disconnected(returned)) => {
                 assert_eq!(returned.offset.get(), 1);
             }
             Err(error) => panic!("receiver should be disconnected: {error:?}"),
